@@ -73,8 +73,33 @@ def client_config_path() -> Path:
     return base / "spider" / "config.toml"
 
 
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
 def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a string so it is a valid TOML basic string.
+
+    TOML forbids raw control characters inside a basic string. Escaping only
+    backslash and quote leaves a pasted trailing newline in the file verbatim,
+    and `tomllib` then refuses to parse the config back.
+    """
+    out: list[str] = []
+    for char in value:
+        if char in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[char])
+        elif char < " " or char == "\x7f":
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def save_client_config(config: ClientConfig, path: Path | None = None) -> Path:
@@ -85,9 +110,14 @@ def save_client_config(config: ClientConfig, path: Path | None = None) -> Path:
         f'token = "{_toml_escape(config.token)}"\n'
         f'device = "{_toml_escape(config.device)}"\n'
     )
-    # Create with 0600 from the start so the token is never briefly world-readable.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # The mode passed to os.open applies only when it creates the file, so
+        # an existing config left at 0644 would hold the new token at that wider
+        # mode. Narrow the open descriptor before any bytes are written; the
+        # write is buffered, so nothing has reached the disk yet.
+        if hasattr(os, "fchmod"):
+            os.fchmod(handle.fileno(), 0o600)
         handle.write(body)
     path.chmod(0o600)
     return path
@@ -112,7 +142,11 @@ def load_client_config(
 
 
 def has_insecure_permissions(path: Path) -> bool:
-    """True when anyone other than the owner can read the file holding the token."""
+    """True when the file holding the token is reachable by anyone but its owner.
+
+    The mask is deliberately wider than "readable": a group-writable config is
+    a way to acquire the token too. It over-reports rather than under-reports.
+    """
     if os.name == "nt" or not path.exists():
         return False
     mode = stat.S_IMODE(path.stat().st_mode)

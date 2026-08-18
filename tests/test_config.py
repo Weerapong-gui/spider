@@ -73,6 +73,34 @@ def test_client_config_survives_special_characters_in_token(tmp_path):
     assert load_client_config(path, env={}).token == original.token
 
 
+@pytest.mark.parametrize(
+    "awkward",
+    ["\n", "\r", "\t", "\x00", "\x1f", "\x7f", '"', "\\", "\b", "\f"],
+    ids=["newline", "cr", "tab", "nul", "unit-sep", "del", "quote", "backslash", "bs", "ff"],
+)
+def test_control_characters_survive_the_toml_round_trip(tmp_path, awkward):
+    """A token pasted with a trailing newline used to write a file tomllib
+    refused to read back."""
+    path = tmp_path / "config.toml"
+    original = ClientConfig(
+        server=f"http://x{awkward}:8181", token=awkward + "z" * 40, device=f"pc{awkward}"
+    )
+    save_client_config(original, path)
+    assert load_client_config(path, env={}) == original
+
+
+def test_saving_over_a_wide_file_narrows_it_before_writing(tmp_path):
+    """os.open's mode applies only at creation, so an existing 0644 config would
+    otherwise hold the new token at the wider mode."""
+    path = tmp_path / "config.toml"
+    path.write_text('server = "old"\n', encoding="utf-8")
+    path.chmod(0o644)
+    save_client_config(
+        ClientConfig(server="http://x:8181", token=GOOD_TOKEN, device="d"), path
+    )
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_env_token_overrides_the_file(tmp_path):
     path = tmp_path / "config.toml"
     save_client_config(
