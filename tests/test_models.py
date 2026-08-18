@@ -21,6 +21,35 @@ def test_ulids_sort_by_creation_time():
     assert first < second
 
 
+def test_a_run_of_ulids_is_strictly_increasing():
+    """Back-to-back calls land in the same millisecond, so the timestamp alone
+    cannot order them. This is the test that fails without the monotonic bump."""
+    ids = [new_ulid() for _ in range(1000)]
+    assert ids == sorted(ids)
+    assert len(set(ids)) == 1000
+
+
+def test_ulids_stay_unique_across_threads():
+    import threading
+
+    produced: list[str] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        batch = [new_ulid() for _ in range(2000)]
+        with lock:
+            produced.extend(batch)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(produced) == 16000
+    assert len(set(produced)) == 16000
+
+
 def test_item_roundtrips_through_json():
     item = Item(
         id=new_ulid(),
