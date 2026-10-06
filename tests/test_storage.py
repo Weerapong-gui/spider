@@ -1,5 +1,8 @@
 import hashlib
+import os
 import sqlite3
+import time as time_module
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -349,3 +352,89 @@ def test_delete_succeeds_when_the_blob_is_already_gone(store):
     store.delete(saved.id)
     with pytest.raises(SpiderError):
         store.get(saved.id)
+
+
+def test_gc_removes_a_stale_partial_upload(store):
+    stale = store.tmp_path("01JD3K7XABCDEFGHJKMNPQRSTV")
+    stale.write_bytes(b"abandoned")
+    old = time_module.time() - 7200
+    os.utime(stale, (old, old))
+    assert store.gc() == 1
+    assert not stale.exists()
+
+
+def test_gc_leaves_a_fresh_partial_upload_alone(store):
+    fresh = store.tmp_path("01JD3K7XABCDEFGHJKMNPQRSTV")
+    fresh.write_bytes(b"in progress")
+    assert store.gc() == 0
+    assert fresh.exists()
+
+
+def test_gc_removes_an_orphaned_blob(store):
+    saved = save_bytes(store, b"x")
+    path = store.blob_path(saved.id)
+    connection = store.connect()
+    try:
+        connection.execute("DELETE FROM items WHERE id = ?", (saved.id,))
+        connection.commit()
+    finally:
+        connection.close()
+    old = time_module.time() - 7200
+    os.utime(path, (old, old))
+    assert store.gc() == 1
+    assert not path.exists()
+
+
+def test_gc_never_touches_a_blob_that_has_a_row(store):
+    saved = save_bytes(store, b"keep me")
+    path = store.blob_path(saved.id)
+    old = time_module.time() - 999999
+    os.utime(path, (old, old))
+    assert store.gc() == 0
+    assert path.read_bytes() == b"keep me"
+
+
+def test_verify_reports_nothing_for_a_healthy_store(store):
+    save_bytes(store, b"a")
+    save_bytes(store, b"b")
+    assert store.verify() == []
+
+
+def test_verify_reports_an_item_whose_blob_was_deleted_externally(store):
+    healthy = save_bytes(store, b"a", name="healthy")
+    broken = save_bytes(store, b"b", name="broken")
+    store.blob_path(broken.id).unlink()
+    reported = store.verify()
+    assert [item.id for item in reported] == [broken.id]
+    assert healthy.id not in {item.id for item in reported}
+
+
+def _backdate(store, item_id: str, days: int) -> None:
+    when = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    connection = store.connect()
+    try:
+        connection.execute("UPDATE items SET created_at = ? WHERE id = ?", (when, item_id))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_retention_is_off_by_default(store):
+    old = save_bytes(store, b"ancient", name="ancient")
+    _backdate(store, old.id, 400)
+    assert store.apply_retention(None) == 0
+    assert store.apply_retention(0) == 0
+    assert store.get(old.id).id == old.id
+
+
+def test_retention_deletes_items_past_the_cutoff(store):
+    old = save_bytes(store, b"ancient", name="ancient")
+    recent = save_bytes(store, b"fresh", name="fresh")
+    _backdate(store, old.id, 40)
+    old_path = store.blob_path(old.id)
+
+    assert store.apply_retention(30) == 1
+    assert not old_path.exists()
+    with pytest.raises(SpiderError):
+        store.get(old.id)
+    assert store.get(recent.id).id == recent.id

@@ -12,8 +12,9 @@ import hashlib
 import secrets
 import shutil
 import sqlite3
+import time
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 
@@ -308,3 +309,74 @@ class Storage:
         finally:
             connection.close()
         self.blob_path(item.id).unlink(missing_ok=True)
+
+    def gc(self, max_age_seconds: int = 3600) -> int:
+        """Remove abandoned partial uploads and blobs no row points at.
+
+        Both are the residue of a crash between writing bytes and committing
+        the row. The age threshold is what keeps an upload that is still in
+        flight from being swept away underneath itself.
+        """
+        cutoff = time.time() - max_age_seconds
+        removed = 0
+
+        for partial in self.tmp_dir.glob("*.part"):
+            if partial.stat().st_mtime < cutoff:
+                partial.unlink(missing_ok=True)
+                removed += 1
+
+        connection = self.connect()
+        try:
+            known = {row["id"] for row in connection.execute("SELECT id FROM items")}
+        finally:
+            connection.close()
+
+        for blob in self.blobs_dir.rglob("*"):
+            if not blob.is_file() or self.tmp_dir in blob.parents:
+                continue
+            if blob.name in known:
+                continue
+            if blob.stat().st_mtime < cutoff:
+                blob.unlink(missing_ok=True)
+                removed += 1
+
+        return removed
+
+    def verify(self) -> list[Item]:
+        """Return every item whose bytes are no longer on disk.
+
+        The data directory sits inside a Samba share, so a file can disappear
+        without the database ever hearing about it. Reporting that as a list is
+        more useful than a 500 at download time.
+        """
+        connection = self.connect()
+        try:
+            rows = connection.execute("SELECT * FROM items ORDER BY id DESC").fetchall()
+        finally:
+            connection.close()
+        return [
+            item
+            for item in (self._row_to_item(row) for row in rows)
+            if not self.blob_path(item.id).is_file()
+        ]
+
+    def apply_retention(self, days: int | None) -> int:
+        """Delete items older than `days`. Off unless explicitly configured.
+
+        The default is to keep everything forever: this is the only copy of
+        whatever was pushed, and silently deleting someone's data because a
+        timer went off is not a default worth having.
+        """
+        if not days or days <= 0:
+            return 0
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT id FROM items WHERE created_at < ?", (cutoff,)
+            ).fetchall()
+        finally:
+            connection.close()
+        for row in rows:
+            self.delete(row["id"])
+        return len(rows)
