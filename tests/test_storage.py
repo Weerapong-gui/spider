@@ -212,3 +212,140 @@ def test_empty_payload_is_stored(store):
     assert item.size == 0
     assert item.sha256 == hashlib.sha256(b"").hexdigest()
     assert store.blob_path(item.id).read_bytes() == b""
+
+
+def test_get_returns_the_saved_item(store):
+    saved = save_bytes(store, b"abc", name="abc.bin")
+    assert store.get(saved.id) == saved
+
+
+def test_get_raises_not_found_for_an_unknown_id(store):
+    with pytest.raises(SpiderError) as caught:
+        store.get("01JD3K7XABCDEFGHJKMNPQRSTV")
+    assert caught.value.code is ErrorCode.not_found
+
+
+def test_resolve_latest_returns_the_newest_item(store):
+    save_bytes(store, b"first", name="first")
+    newest = save_bytes(store, b"second", name="second")
+    assert store.resolve("latest").id == newest.id
+
+
+def test_resolve_latest_on_an_empty_store_raises_not_found(store):
+    with pytest.raises(SpiderError) as caught:
+        store.resolve("latest")
+    assert caught.value.code is ErrorCode.not_found
+
+
+def test_resolve_accepts_a_full_id(store):
+    saved = save_bytes(store, b"x")
+    assert store.resolve(saved.id).id == saved.id
+
+
+def test_resolve_accepts_a_lowercase_prefix(store):
+    saved = save_bytes(store, b"x")
+    assert store.resolve(saved.id[:8].lower()).id == saved.id
+
+
+def test_resolve_reports_an_ambiguous_prefix(store):
+    first = save_bytes(store, b"a")
+    save_bytes(store, b"b")
+    with pytest.raises(SpiderError) as caught:
+        store.resolve(first.id[:4])
+    assert caught.value.code is ErrorCode.ambiguous_id
+
+
+def test_resolve_rejects_characters_that_cannot_appear_in_an_id(store):
+    save_bytes(store, b"x")
+    with pytest.raises(SpiderError) as caught:
+        store.resolve("%")
+    assert caught.value.code is ErrorCode.not_found
+
+
+def test_list_returns_newest_first(store):
+    first = save_bytes(store, b"1", name="one")
+    second = save_bytes(store, b"2", name="two")
+    page = store.list_items()
+    assert [item.id for item in page.items] == [second.id, first.id]
+
+
+def test_list_paginates_with_a_cursor(store):
+    ids = [save_bytes(store, bytes([n]), name=f"n{n}").id for n in range(5)]
+    first_page = store.list_items(limit=2)
+    assert [item.id for item in first_page.items] == ids[4:2:-1]
+    assert first_page.next_before == ids[3]
+    second_page = store.list_items(limit=2, before=first_page.next_before)
+    assert [item.id for item in second_page.items] == ids[2:0:-1]
+
+
+def test_cursor_paging_is_unaffected_by_newly_added_items(store):
+    ids = [save_bytes(store, bytes([n]), name=f"n{n}").id for n in range(4)]
+    first_page = store.list_items(limit=2)
+    save_bytes(store, b"new arrival", name="newcomer")
+    second_page = store.list_items(limit=2, before=first_page.next_before)
+    seen = [item.id for item in first_page.items] + [item.id for item in second_page.items]
+    assert seen == ids[::-1]
+    assert len(seen) == len(set(seen))
+
+
+def test_list_exhausted_returns_no_cursor(store):
+    save_bytes(store, b"only")
+    assert store.list_items(limit=10).next_before is None
+
+
+def test_list_filters_by_kind(store):
+    save_bytes(store, b"a file")
+    text = save_bytes(store, b"a note", kind=ItemKind.text, name="note")
+    page = store.list_items(kind=ItemKind.text)
+    assert [item.id for item in page.items] == [text.id]
+
+
+def test_list_searches_name_and_preview(store):
+    named = save_bytes(store, b"data", name="quarterly-invoice.pdf")
+    inside = save_bytes(store, b"see the invoice attached", kind=ItemKind.text, name="memo")
+    save_bytes(store, b"unrelated", name="cat.png")
+    found = {item.id for item in store.list_items(q="invoice").items}
+    assert found == {named.id, inside.id}
+
+
+def test_search_treats_wildcards_literally(store):
+    save_bytes(store, b"x", name="report.pdf")
+    assert store.list_items(q="%").items == []
+
+
+def test_open_blob_returns_the_exact_bytes(store):
+    payload = bytes(range(256))
+    saved = save_bytes(store, payload)
+    with store.open_blob(saved.id) as handle:
+        assert handle.read() == payload
+
+
+def test_open_blob_raises_not_found_when_the_file_vanished(store):
+    saved = save_bytes(store, b"x")
+    store.blob_path(saved.id).unlink()
+    with pytest.raises(SpiderError) as caught:
+        store.open_blob(saved.id)
+    assert caught.value.code is ErrorCode.not_found
+
+
+def test_delete_removes_both_the_row_and_the_blob(store):
+    saved = save_bytes(store, b"x")
+    path = store.blob_path(saved.id)
+    store.delete(saved.id)
+    assert not path.exists()
+    with pytest.raises(SpiderError):
+        store.get(saved.id)
+
+
+def test_delete_of_an_unknown_id_raises_not_found(store):
+    with pytest.raises(SpiderError) as caught:
+        store.delete("01JD3K7XABCDEFGHJKMNPQRSTV")
+    assert caught.value.code is ErrorCode.not_found
+
+
+def test_delete_succeeds_when_the_blob_is_already_gone(store):
+    saved = save_bytes(store, b"x")
+    store.blob_path(saved.id).unlink()
+    store.delete(saved.id)
+    with pytest.raises(SpiderError):
+        store.get(saved.id)

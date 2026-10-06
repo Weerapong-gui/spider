@@ -15,12 +15,15 @@ import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import Item, ItemKind, new_ulid
+from spider.core.models import Item, ItemKind, ItemPage, new_ulid
 
 PREVIEW_CHARS = 200
 _PREVIEW_BYTES = PREVIEW_CHARS * 4  # worst case for UTF-8
+_ID_ALPHABET = frozenset("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+_MAX_LIMIT = 200
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -181,3 +184,127 @@ class Storage:
         finally:
             connection.close()
         return item
+
+    @staticmethod
+    def _row_to_item(row) -> Item:
+        return Item(
+            id=row["id"],
+            kind=ItemKind(row["kind"]),
+            name=row["name"],
+            size=row["size"],
+            sha256=row["sha256"],
+            content_type=row["content_type"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            source_device=row["source_device"],
+            preview=row["preview"],
+        )
+
+    def get(self, item_id: str) -> Item:
+        connection = self.connect()
+        try:
+            row = connection.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise SpiderError(ErrorCode.not_found, f"No item with id {item_id}.")
+        return self._row_to_item(row)
+
+    def resolve(self, ref: str) -> Item:
+        """Turn a user-typed reference into one item.
+
+        Doing this on the server keeps the CLI and the web UI in agreement
+        without either of them having to fetch a listing and match locally.
+        """
+        ref = ref.strip()
+        connection = self.connect()
+        try:
+            if ref.lower() == "latest":
+                row = connection.execute("SELECT * FROM items ORDER BY id DESC LIMIT 1").fetchone()
+                if row is None:
+                    raise SpiderError(ErrorCode.not_found, "There are no items yet.")
+                return self._row_to_item(row)
+
+            prefix = ref.upper()
+            # ULIDs use a fixed alphabet, so anything outside it cannot match.
+            # Checking here also means no LIKE metacharacter ever reaches SQL.
+            if not prefix or not set(prefix) <= _ID_ALPHABET:
+                raise SpiderError(ErrorCode.not_found, f"No item matching {ref!r}.")
+
+            rows = connection.execute(
+                "SELECT * FROM items WHERE id LIKE ? ORDER BY id DESC LIMIT 2",
+                (prefix + "%",),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        if not rows:
+            raise SpiderError(ErrorCode.not_found, f"No item matching {ref!r}.")
+        if len(rows) > 1:
+            candidates = ", ".join(row["id"] for row in rows)
+            raise SpiderError(
+                ErrorCode.ambiguous_id,
+                f"{ref!r} matches more than one item: {candidates}. Use more characters.",
+            )
+        return self._row_to_item(rows[0])
+
+    def list_items(
+        self,
+        *,
+        limit: int = 50,
+        before: str | None = None,
+        q: str | None = None,
+        kind: ItemKind | None = None,
+    ) -> ItemPage:
+        limit = max(1, min(int(limit), _MAX_LIMIT))
+        clauses: list[str] = []
+        params: list[object] = []
+
+        if before:
+            clauses.append("id < ?")
+            params.append(before.strip().upper())
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind.value)
+        if q:
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            clauses.append("(name LIKE ? ESCAPE '\\' OR IFNULL(preview, '') LIKE ? ESCAPE '\\')")
+            params.extend([pattern, pattern])
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM items {where} ORDER BY id DESC LIMIT ?",  # noqa: S608
+                (*params, limit + 1),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        items = [self._row_to_item(row) for row in rows[:limit]]
+        next_before = items[-1].id if len(rows) > limit and items else None
+        return ItemPage(items=items, next_before=next_before)
+
+    def open_blob(self, item_id: str) -> BinaryIO:
+        path = self.blob_path(item_id)
+        if not path.is_file():
+            raise SpiderError(
+                ErrorCode.not_found,
+                f"The stored file for {item_id} is missing. Run `spider verify`.",
+            )
+        return path.open("rb")
+
+    def delete(self, item_id: str) -> None:
+        """Drop the row first, then the blob.
+
+        A crash between the two leaves an orphan blob, which garbage collection
+        removes -- never a row pointing at a file that is gone.
+        """
+        item = self.get(item_id)
+        connection = self.connect()
+        try:
+            connection.execute("DELETE FROM items WHERE id = ?", (item.id,))
+            connection.commit()
+        finally:
+            connection.close()
+        self.blob_path(item.id).unlink(missing_ok=True)
