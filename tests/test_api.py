@@ -1,9 +1,14 @@
+import hashlib
+import io
+
 import pytest
 from fastapi.testclient import TestClient
 
 from spider.core.config import MIN_TOKEN_LENGTH
+from spider.core.errors import ErrorCode, SpiderError
 from spider.server.app import create_app, create_app_from_env
 from spider.server.auth import SESSION_COOKIE, bearer_from_header, token_matches
+from spider.server.routes import _chunks
 from spider.server.storage import Storage
 
 TOKEN = "s" * MIN_TOKEN_LENGTH
@@ -96,3 +101,97 @@ def test_create_app_from_env_builds_a_working_app(tmp_path):
     )
     with TestClient(app) as test_client:
         assert test_client.get("/healthz").status_code == 200
+
+
+def upload(client, payload: bytes, *, name="thing.bin", kind="file", **fields):
+    data = {"kind": kind, "name": name, "device": "test-device", **fields}
+    return client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": (name, payload, "application/octet-stream")},
+        data=data,
+    )
+
+
+def test_upload_returns_201_and_the_item(client):
+    payload = b"hello over http"
+    response = upload(client, payload, name="greeting.txt")
+    assert response.status_code == 201
+    body = response.json()
+    assert body["name"] == "greeting.txt"
+    assert body["size"] == len(payload)
+    assert body["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert body["source_device"] == "test-device"
+    assert len(body["id"]) == 26
+
+
+def test_upload_requires_a_token(client):
+    response = client.post(
+        "/api/items",
+        files={"content": ("x.bin", b"x", "application/octet-stream")},
+        data={"name": "x.bin"},
+    )
+    assert response.status_code == 401
+
+
+def test_upload_accepts_a_matching_checksum(client):
+    payload = b"verified"
+    response = upload(client, payload, sha256=hashlib.sha256(payload).hexdigest())
+    assert response.status_code == 201
+
+
+def test_upload_rejects_a_wrong_checksum(client):
+    response = upload(client, b"real", sha256="f" * 64)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "checksum_mismatch"
+
+
+def test_upload_of_text_sets_a_text_content_type_and_preview(client):
+    response = client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": ("note", "สวัสดี".encode(), "application/octet-stream")},
+        data={"kind": "text", "name": "note", "device": "test-device"},
+    )
+    body = response.json()
+    assert body["kind"] == "text"
+    assert body["content_type"] == "text/plain; charset=utf-8"
+    assert body["preview"] == "สวัสดี"
+
+
+def test_upload_falls_back_to_the_uploaded_filename(client):
+    response = client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": ("from-disk.pdf", b"%PDF-", "application/pdf")},
+        data={"device": "test-device"},
+    )
+    assert response.json()["name"] == "from-disk.pdf"
+    assert response.json()["content_type"] == "application/pdf"
+
+
+def test_upload_is_refused_when_the_disk_is_nearly_full(tmp_path):
+    storage = Storage(tmp_path / "data", min_free_gb=1_000_000)
+    storage.init()
+    with TestClient(create_app(storage, TOKEN)) as full_client:
+        response = upload(full_client, b"anything")
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == "disk_full"
+
+
+def test_upload_is_refused_above_the_configured_size_limit(tmp_path):
+    storage = Storage(tmp_path / "data", min_free_gb=0)
+    storage.init()
+    app = create_app(storage, TOKEN, max_item_mb=1)
+    with TestClient(app) as limited_client:
+        response = upload(limited_client, b"z" * (2 * 1024 * 1024))
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "bad_request"
+
+
+def test_size_limit_is_enforced_on_the_bytes_actually_received():
+    """Content-Length can be absent (chunked uploads), so count while streaming."""
+    stream = _chunks(io.BytesIO(b"z" * 10), size=4, limit=8)
+    with pytest.raises(SpiderError) as caught:
+        list(stream)
+    assert caught.value.code is ErrorCode.bad_request

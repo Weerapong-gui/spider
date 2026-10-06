@@ -24,7 +24,7 @@ CONTENT_SECURITY_POLICY = (
 )
 
 
-def create_app(storage: Storage, token: str) -> FastAPI:
+def create_app(storage: Storage, token: str, max_item_mb: int = 0) -> FastAPI:
     # No docs endpoints: they are one more surface and nobody reads them here.
     app = FastAPI(title="spider", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.storage = storage
@@ -51,7 +51,7 @@ def create_app(storage: Storage, token: str) -> FastAPI:
     # through to the file server.
     from spider.server.routes import build_router
 
-    app.include_router(build_router(storage, token))
+    app.include_router(build_router(storage, token, max_item_mb))
 
     if STATIC_DIR.is_dir():
         app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
@@ -65,4 +65,4 @@ def create_app_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
     storage.init()
     storage.gc()
     storage.apply_retention(config.retention_days)
-    return create_app(storage, config.token)
+    return create_app(storage, config.token, config.max_item_mb)
