@@ -195,3 +195,23 @@ def test_size_limit_is_enforced_on_the_bytes_actually_received():
     with pytest.raises(SpiderError) as caught:
         list(stream)
     assert caught.value.code is ErrorCode.bad_request
+
+
+def test_an_invalid_form_field_uses_the_standard_error_shape(client):
+    response = upload(client, b"x", kind="bogus")
+    assert response.status_code == 400
+    body = response.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "bad_request"
+    assert "kind" in body["error"]["message"]
+
+
+def test_a_missing_upload_field_uses_the_standard_error_shape(client):
+    response = client.post("/api/items", headers=AUTH, data={"name": "x"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "bad_request"
+
+
+def test_auth_is_checked_before_form_validation(client):
+    response = client.post("/api/items", data={"kind": "bogus"})
+    assert response.status_code == 401

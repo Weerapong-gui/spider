@@ -6,11 +6,12 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from spider.core.config import load_server_config
-from spider.core.errors import SpiderError
+from spider.core.errors import ErrorCode, SpiderError
 from spider.server.storage import Storage
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -33,6 +34,17 @@ def create_app(storage: Storage, token: str, max_item_mb: int = 0) -> FastAPI:
     @app.exception_handler(SpiderError)
     async def handle_spider_error(_: Request, exc: SpiderError) -> JSONResponse:
         return JSONResponse(status_code=exc.http_status, content=exc.to_payload())
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # Keep FastAPI's default 422 body out of the API: every client parses
+        # one error shape, and a malformed request is a bad_request.
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'][1:]) or 'request'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        error = SpiderError(ErrorCode.bad_request, f"Invalid request. {problems}")
+        return JSONResponse(status_code=error.http_status, content=error.to_payload())
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
