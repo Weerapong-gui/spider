@@ -369,3 +369,35 @@ def test_download_filename_strips_quotes_backslashes_and_control_characters(clie
     ).headers["content-disposition"]
     assert disposition.startswith('attachment; filename="abcd.txt";')
     assert "\r" not in disposition and "\n" not in disposition
+
+
+def test_session_exchange_sets_a_hardened_cookie(client):
+    response = client.post("/api/session", json={"token": TOKEN})
+    assert response.status_code == 204
+    # Cookie attribute names and values are case-insensitive (RFC 6265).
+    attributes = {part.strip().lower() for part in response.headers["set-cookie"].split(";")}
+    assert "httponly" in attributes
+    assert "samesite=strict" in attributes
+    assert "path=/" in attributes
+
+
+def test_a_session_cookie_authorises_later_requests(client):
+    client.post("/api/session", json={"token": TOKEN})
+    assert client.get("/api/items").status_code == 200
+
+
+def test_session_exchange_rejects_a_wrong_token(client):
+    response = client.post("/api/session", json={"token": "wrong"})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_session_exchange_needs_no_existing_credentials(client):
+    assert client.get("/api/items").status_code == 401
+    assert client.post("/api/session", json={"token": TOKEN}).status_code == 204
+
+
+def test_logout_clears_the_cookie(client):
+    client.post("/api/session", json={"token": TOKEN})
+    assert client.delete("/api/session").status_code == 204
+    assert client.get("/api/items").status_code == 401

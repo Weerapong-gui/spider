@@ -8,15 +8,20 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from spider.core.errors import ErrorCode, SpiderError
 from spider.core.models import Item, ItemKind, ItemPage
-from spider.server.auth import make_auth_dependency
+from spider.server.auth import SESSION_COOKIE, make_auth_dependency, token_matches
 from spider.server.storage import Storage
 
 TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
 _CHUNK = 1024 * 1024
 _INLINE_EXACT = frozenset({"application/pdf", "text/plain"})
+
+
+class SessionRequest(BaseModel):
+    token: str
 
 
 def _chunks(handle: BinaryIO, size: int = _CHUNK, limit: int = 0) -> Iterator[bytes]:
@@ -61,7 +66,7 @@ def content_disposition(name: str, inline: bool) -> str:
     return f"{kind}; filename=\"{ascii_name or 'download'}\"; filename*=UTF-8''{quote(name)}"
 
 
-def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> APIRouter:
+def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[APIRouter]:
     require_auth = make_auth_dependency(token)
     router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
 
@@ -149,4 +154,29 @@ def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> APIRoute
         storage.delete(item.id)
         return Response(status_code=204)
 
-    return router
+    # Not under the authenticated router: exchanging a token for a cookie is how
+    # a browser gets credentials in the first place.
+    session_router = APIRouter(prefix="/api")
+
+    @session_router.post("/session", status_code=204)
+    def create_session(body: SessionRequest) -> Response:
+        if not token_matches(token, body.token):
+            raise SpiderError(ErrorCode.unauthorized, "That token is not correct.")
+        response = Response(status_code=204)
+        response.set_cookie(
+            SESSION_COOKIE,
+            token,
+            httponly=True,
+            samesite="strict",
+            path="/",
+            max_age=60 * 60 * 24 * 365,
+        )
+        return response
+
+    @session_router.delete("/session", status_code=204)
+    def destroy_session() -> Response:
+        response = Response(status_code=204)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return response
+
+    return [router, session_router]

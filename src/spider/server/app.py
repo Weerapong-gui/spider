@@ -63,7 +63,8 @@ def create_app(storage: Storage, token: str, max_item_mb: int = 0) -> FastAPI:
     # through to the file server.
     from spider.server.routes import build_router
 
-    app.include_router(build_router(storage, token, max_item_mb))
+    for sub_router in build_router(storage, token, max_item_mb):
+        app.include_router(sub_router)
 
     if STATIC_DIR.is_dir():
         app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
