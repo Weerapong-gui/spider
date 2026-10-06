@@ -1,7 +1,10 @@
+import hashlib
 import sqlite3
 
 import pytest
 
+from spider.core.errors import ErrorCode, SpiderError
+from spider.core.models import ItemKind
 from spider.server.storage import Storage
 
 
@@ -66,3 +69,146 @@ def test_connect_returns_a_usable_connection(store):
         assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+
+def chunks(payload: bytes, size: int = 7):
+    for offset in range(0, len(payload), size):
+        yield payload[offset : offset + size]
+
+
+def save_bytes(store, payload: bytes, *, kind=ItemKind.file, name="thing.bin", **kwargs):
+    return store.save(
+        stream=chunks(payload),
+        kind=kind,
+        name=name,
+        content_type="application/octet-stream",
+        source_device="test-device",
+        **kwargs,
+    )
+
+
+def test_save_writes_the_blob_and_returns_a_complete_item(store):
+    payload = b"hello spider"
+    item = save_bytes(store, payload)
+    assert item.size == len(payload)
+    assert item.sha256 == hashlib.sha256(payload).hexdigest()
+    assert item.source_device == "test-device"
+    assert store.blob_path(item.id).read_bytes() == payload
+
+
+def test_save_inserts_exactly_one_row(store):
+    save_bytes(store, b"x")
+    connection = store.connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_save_leaves_no_temporary_file_behind(store):
+    save_bytes(store, b"x" * 5000)
+    assert list(store.tmp_dir.iterdir()) == []
+
+
+def test_save_writes_incrementally_instead_of_buffering(store):
+    """Watch the temporary file grow while the stream is still being consumed.
+
+    An implementation that collected every chunk before writing would leave the
+    file at zero bytes until the generator was exhausted.
+    """
+    sizes = []
+
+    def probing_stream():
+        for _ in range(4):
+            yield b"z" * 4096
+            partials = list(store.tmp_dir.glob("*.part"))
+            sizes.append(partials[0].stat().st_size if partials else 0)
+
+    item = store.save(
+        stream=probing_stream(),
+        kind=ItemKind.file,
+        name="big.bin",
+        content_type="application/octet-stream",
+        source_device="test-device",
+    )
+    assert item.size == 4 * 4096
+    assert sizes[0] > 0, "nothing was written until the stream ended"
+    assert sizes == sorted(sizes)
+    assert sizes[-1] > sizes[0]
+
+
+def test_save_verifies_a_supplied_checksum(store):
+    payload = b"trustworthy"
+    item = save_bytes(store, payload, expected_sha256=hashlib.sha256(payload).hexdigest())
+    assert item.sha256 == hashlib.sha256(payload).hexdigest()
+
+
+def test_save_rejects_a_wrong_checksum(store):
+    with pytest.raises(SpiderError) as caught:
+        save_bytes(store, b"real bytes", expected_sha256="f" * 64)
+    assert caught.value.code is ErrorCode.checksum_mismatch
+
+
+def test_a_rejected_checksum_leaves_nothing_behind(store):
+    with pytest.raises(SpiderError):
+        save_bytes(store, b"real bytes", expected_sha256="f" * 64)
+    assert list(store.tmp_dir.iterdir()) == []
+    connection = store.connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_a_failing_stream_leaves_nothing_behind(store):
+    def exploding():
+        yield b"partial"
+        raise OSError("cable unplugged")
+
+    with pytest.raises(OSError, match="cable unplugged"):
+        store.save(
+            stream=exploding(),
+            kind=ItemKind.file,
+            name="doomed.bin",
+            content_type="application/octet-stream",
+            source_device="test-device",
+        )
+    assert list(store.tmp_dir.iterdir()) == []
+    connection = store.connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_save_refuses_when_free_space_is_below_the_floor(tmp_path):
+    store = Storage(tmp_path / "data", min_free_gb=1_000_000)
+    store.init()
+    with pytest.raises(SpiderError) as caught:
+        save_bytes(store, b"anything")
+    assert caught.value.code is ErrorCode.disk_full
+
+
+def test_text_items_get_a_preview(store):
+    item = save_bytes(store, "สวัสดี ครับ".encode(), kind=ItemKind.text, name="greeting")
+    assert item.preview == "สวัสดี ครับ"
+
+
+def test_preview_is_capped_and_never_splits_a_character(store):
+    payload = ("ก" * 500).encode()
+    item = save_bytes(store, payload, kind=ItemKind.text, name="long")
+    assert len(item.preview) == 200
+    assert item.preview == "ก" * 200
+
+
+def test_file_items_have_no_preview(store):
+    item = save_bytes(store, b"\x00\x01\x02")
+    assert item.preview is None
+
+
+def test_empty_payload_is_stored(store):
+    item = save_bytes(store, b"")
+    assert item.size == 0
+    assert item.sha256 == hashlib.sha256(b"").hexdigest()
+    assert store.blob_path(item.id).read_bytes() == b""
