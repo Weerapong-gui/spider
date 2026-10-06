@@ -8,7 +8,7 @@ from spider.core.config import MIN_TOKEN_LENGTH
 from spider.core.errors import ErrorCode, SpiderError
 from spider.server.app import create_app, create_app_from_env
 from spider.server.auth import SESSION_COOKIE, bearer_from_header, token_matches
-from spider.server.routes import _chunks
+from spider.server.routes import _chunks, is_inline_safe
 from spider.server.storage import Storage
 
 TOKEN = "s" * MIN_TOKEN_LENGTH
@@ -215,3 +215,157 @@ def test_a_missing_upload_field_uses_the_standard_error_shape(client):
 def test_auth_is_checked_before_form_validation(client):
     response = client.post("/api/items", data={"kind": "bogus"})
     assert response.status_code == 401
+
+
+def test_inline_whitelist():
+    assert is_inline_safe("image/png") is True
+    assert is_inline_safe("application/pdf") is True
+    assert is_inline_safe("text/plain; charset=utf-8") is True
+    assert is_inline_safe("image/svg+xml") is False
+    assert is_inline_safe("text/html") is False
+    assert is_inline_safe("application/octet-stream") is False
+
+
+def test_list_returns_newest_first(client):
+    upload(client, b"1", name="one")
+    upload(client, b"2", name="two")
+    body = client.get("/api/items", headers=AUTH).json()
+    assert [item["name"] for item in body["items"]] == ["two", "one"]
+    assert body["next_before"] is None
+
+
+def test_list_paginates(client):
+    for n in range(5):
+        upload(client, bytes([n]), name=f"n{n}")
+    first = client.get("/api/items?limit=2", headers=AUTH).json()
+    assert len(first["items"]) == 2
+    assert first["next_before"] is not None
+    second = client.get(
+        f"/api/items?limit=2&before={first['next_before']}", headers=AUTH
+    ).json()
+    assert len(second["items"]) == 2
+    ids = [item["id"] for item in first["items"] + second["items"]]
+    assert len(set(ids)) == 4
+
+
+def test_list_filters_by_kind_and_search(client):
+    upload(client, b"data", name="invoice.pdf")
+    upload(client, b"other", name="cat.png")
+    body = client.get("/api/items?q=invoice", headers=AUTH).json()
+    assert [item["name"] for item in body["items"]] == ["invoice.pdf"]
+    body = client.get("/api/items?kind=file&limit=50", headers=AUTH).json()
+    assert len(body["items"]) == 2
+
+
+def test_metadata_by_prefix(client):
+    created = upload(client, b"x", name="x.bin").json()
+    body = client.get(f"/api/items/{created['id'][:8]}", headers=AUTH).json()
+    assert body["id"] == created["id"]
+
+
+def test_metadata_latest(client):
+    upload(client, b"old", name="old")
+    newest = upload(client, b"new", name="new").json()
+    assert client.get("/api/items/latest", headers=AUTH).json()["id"] == newest["id"]
+
+
+def test_metadata_unknown_returns_404(client):
+    response = client.get("/api/items/01JD3K7XABCDEFGHJKMNPQRSTV", headers=AUTH)
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_ambiguous_prefix_returns_409(client):
+    first = upload(client, b"a", name="a").json()
+    upload(client, b"b", name="b")
+    response = client.get(f"/api/items/{first['id'][:3]}", headers=AUTH)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "ambiguous_id"
+
+
+def test_download_returns_the_exact_bytes(client):
+    payload = bytes(range(256))
+    created = upload(client, payload, name="all-bytes.bin").json()
+    response = client.get(f"/api/items/{created['id']}/content", headers=AUTH)
+    assert response.status_code == 200
+    assert response.content == payload
+    assert response.headers["x-spider-sha256"] == created["sha256"]
+    assert response.headers["content-length"] == str(len(payload))
+
+
+def test_download_defaults_to_attachment(client):
+    created = upload(client, b"%PDF-", name="doc.pdf").json()
+    response = client.get(f"/api/items/{created['id']}/content", headers=AUTH)
+    assert response.headers["content-disposition"].startswith("attachment")
+
+
+def test_inline_is_allowed_for_a_pdf(client):
+    response = client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": ("doc.pdf", b"%PDF-", "application/pdf")},
+        data={"device": "test-device"},
+    )
+    item_id = response.json()["id"]
+    headers = client.get(f"/api/items/{item_id}/content?disposition=inline", headers=AUTH).headers
+    assert headers["content-disposition"].startswith("inline")
+
+
+def test_inline_is_refused_for_html(client):
+    response = client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": ("page.html", b"<script>alert(1)</script>", "text/html")},
+        data={"device": "test-device"},
+    )
+    item_id = response.json()["id"]
+    headers = client.get(f"/api/items/{item_id}/content?disposition=inline", headers=AUTH).headers
+    assert headers["content-disposition"].startswith("attachment")
+
+
+def test_inline_is_refused_for_svg(client):
+    response = client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": ("logo.svg", b"<svg onload=alert(1)>", "image/svg+xml")},
+        data={"device": "test-device"},
+    )
+    item_id = response.json()["id"]
+    headers = client.get(f"/api/items/{item_id}/content?disposition=inline", headers=AUTH).headers
+    assert headers["content-disposition"].startswith("attachment")
+
+
+def test_download_encodes_a_non_ascii_filename(client):
+    created = upload(client, b"x", name="รายงาน.pdf").json()
+    disposition = client.get(
+        f"/api/items/{created['id']}/content", headers=AUTH
+    ).headers["content-disposition"]
+    assert "filename*=UTF-8''" in disposition
+
+
+def test_delete_removes_the_item(client):
+    created = upload(client, b"x", name="x").json()
+    assert client.delete(f"/api/items/{created['id']}", headers=AUTH).status_code == 204
+    assert client.get(f"/api/items/{created['id']}", headers=AUTH).status_code == 404
+
+
+def test_delete_unknown_returns_404(client):
+    response = client.delete("/api/items/01JD3K7XABCDEFGHJKMNPQRSTV", headers=AUTH)
+    assert response.status_code == 404
+
+
+def test_verify_reports_missing_blobs(client, store):
+    created = upload(client, b"x", name="x").json()
+    assert client.get("/api/verify", headers=AUTH).json() == {"missing": []}
+    store.blob_path(created["id"]).unlink()
+    body = client.get("/api/verify", headers=AUTH).json()
+    assert [item["id"] for item in body["missing"]] == [created["id"]]
+
+
+def test_download_filename_strips_quotes_backslashes_and_control_characters(client):
+    created = upload(client, b"x", name='a"b\\c\r\nd.txt').json()
+    disposition = client.get(
+        f"/api/items/{created['id']}/content", headers=AUTH
+    ).headers["content-disposition"]
+    assert disposition.startswith('attachment; filename="abcd.txt";')
+    assert "\r" not in disposition and "\n" not in disposition
