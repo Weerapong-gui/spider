@@ -36,9 +36,13 @@ cp .env.example .env
 openssl rand -base64 32      # put this in SPIDER_TOKEN
 tailscale ip -4              # put this in SPIDER_BIND_IP
 
-docker compose -f docker/compose.yml up -d --build
-docker compose -f docker/compose.yml logs -f
+docker compose --env-file .env -f docker/compose.yml up -d --build
+docker compose --env-file .env -f docker/compose.yml logs -f
 ```
+
+`--env-file .env` is required: Compose reads `.env` from the folder of the
+compose file (`docker/`), not from where you run the command, and would
+otherwise report every variable as missing.
 
 The server refuses to start without a token of at least 32 characters, and
 Compose refuses to start without `SPIDER_BIND_IP` and `SPIDER_HOST_DATA_DIR`.
