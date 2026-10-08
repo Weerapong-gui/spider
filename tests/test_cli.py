@@ -550,3 +550,23 @@ def test_pull_of_a_hostile_name_stays_in_the_working_directory(cli, tmp_path, mo
     assert result.exit_code == 0
     assert (workdir / "escaped.txt").read_bytes() == b"payload"
     assert not (tmp_path / "escaped.txt").exists()
+
+
+def test_download_of_an_item_whose_blob_is_gone_raises_a_spider_error(api, store):
+    pushed = api.push_bytes(b"x", kind=ItemKind.file, name="gone.bin")
+    store.blob_path(pushed.id).unlink()
+    with pytest.raises(SpiderError) as caught:
+        api.download(pushed.id, io.BytesIO())
+    assert "spider verify" in caught.value.message
+
+
+def test_cat_of_a_missing_blob_prints_an_error_not_a_traceback(cli, store):
+    cli.invoke(cli_main.app, ["push", "-t", "doomed", "--name", "doomed"])
+    for blob in store.blobs_dir.rglob("*"):
+        if blob.is_file() and blob.parent != store.tmp_dir:
+            blob.unlink()
+    result = cli.invoke(cli_main.app, ["cat", "latest"])
+    assert result.exit_code != 0
+    output = " ".join(combined(result).split())  # rich wraps long lines
+    assert "Traceback" not in output
+    assert "spider verify" in output
