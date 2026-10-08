@@ -44,8 +44,13 @@ def test_token_matches_rejects_empty_and_wrong_values():
 
 
 def test_auth_uses_constant_time_comparison():
-    source = (__import__("pathlib").Path(__file__).resolve().parents[1]
-              / "src" / "spider" / "server" / "auth.py").read_text(encoding="utf-8")
+    source = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "src"
+        / "spider"
+        / "server"
+        / "auth.py"
+    ).read_text(encoding="utf-8")
     assert "compare_digest" in source
 
 
@@ -240,9 +245,7 @@ def test_list_paginates(client):
     first = client.get("/api/items?limit=2", headers=AUTH).json()
     assert len(first["items"]) == 2
     assert first["next_before"] is not None
-    second = client.get(
-        f"/api/items?limit=2&before={first['next_before']}", headers=AUTH
-    ).json()
+    second = client.get(f"/api/items?limit=2&before={first['next_before']}", headers=AUTH).json()
     assert len(second["items"]) == 2
     ids = [item["id"] for item in first["items"] + second["items"]]
     assert len(set(ids)) == 4
@@ -337,9 +340,9 @@ def test_inline_is_refused_for_svg(client):
 
 def test_download_encodes_a_non_ascii_filename(client):
     created = upload(client, b"x", name="รายงาน.pdf").json()
-    disposition = client.get(
-        f"/api/items/{created['id']}/content", headers=AUTH
-    ).headers["content-disposition"]
+    disposition = client.get(f"/api/items/{created['id']}/content", headers=AUTH).headers[
+        "content-disposition"
+    ]
     assert "filename*=UTF-8''" in disposition
 
 
@@ -364,9 +367,9 @@ def test_verify_reports_missing_blobs(client, store):
 
 def test_download_filename_strips_quotes_backslashes_and_control_characters(client):
     created = upload(client, b"x", name='a"b\\c\r\nd.txt').json()
-    disposition = client.get(
-        f"/api/items/{created['id']}/content", headers=AUTH
-    ).headers["content-disposition"]
+    disposition = client.get(f"/api/items/{created['id']}/content", headers=AUTH).headers[
+        "content-disposition"
+    ]
     assert disposition.startswith('attachment; filename="abcd.txt";')
     assert "\r" not in disposition and "\n" not in disposition
 
@@ -401,3 +404,33 @@ def test_logout_clears_the_cookie(client):
     client.post("/api/session", json={"token": TOKEN})
     assert client.delete("/api/session").status_code == 204
     assert client.get("/api/items").status_code == 401
+
+
+def test_root_serves_the_page(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "spider" in response.text
+
+
+def test_the_page_carries_a_content_security_policy(client):
+    policy = client.get("/").headers["content-security-policy"]
+    assert "default-src 'self'" in policy
+    assert "unsafe-inline" not in policy
+    assert "frame-ancestors 'none'" in policy
+
+
+def test_the_page_has_no_inline_script(client):
+    body = client.get("/").text
+    assert "<script>" not in body
+    assert "onclick=" not in body
+
+
+def test_static_assets_are_served(client):
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/style.css").status_code == 200
+
+
+def test_the_page_needs_no_token(client):
+    """The page itself must load so the visitor can type their token into it."""
+    assert client.get("/").status_code == 200

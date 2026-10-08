@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spider</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="gate" class="gate hidden">
+  <form id="gate-form" class="card">
+    <h1>spider</h1>
+    <p>Enter the server token for this browser.</p>
+    <input id="gate-token" type="password" autocomplete="current-password" placeholder="token">
+    <button type="submit">Unlock</button>
+    <p id="gate-error" class="error"></p>
+  </form>
+</div>
+
+<main id="app" class="hidden">
+  <header>
+    <h1>spider</h1>
+    <input id="search" type="search" placeholder="Search">
+  </header>
+
+  <form id="compose" class="card">
+    <textarea id="text" rows="4" placeholder="Paste text here, then press Send"></textarea>
+    <div class="row">
+      <button type="submit">Send</button>
+      <label class="file-button">
+        Choose files
+        <input id="file-input" type="file" multiple hidden>
+      </label>
+      <span class="hint">or drop files anywhere on this page</span>
+    </div>
+    <progress id="progress" class="hidden" max="100" value="0"></progress>
+  </form>
+
+  <p id="notice" class="error hidden"></p>
+  <ul id="items"></ul>
+  <p id="empty" class="hint hidden">Nothing here yet.</p>
+</main>
+
+<div id="drop-overlay" class="hidden"><span>Drop to upload</span></div>
+<script src="/app.js"></script>
+</body>
+</html>
