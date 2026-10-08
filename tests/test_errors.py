@@ -104,6 +104,11 @@ def test_server_never_imports_cli():
     assert offenders == set()
 
 
+def test_gui_never_imports_server():
+    offenders = {n for n in _all_imports("gui") if n.startswith("spider.server")}
+    assert offenders == set(), offenders
+
+
 def test_cli_never_imports_server():
     offenders = {n for n in _all_imports("cli") if n.startswith("spider.server")}
     assert offenders == set()

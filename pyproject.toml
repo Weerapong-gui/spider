@@ -21,6 +21,10 @@ cli = [
     "rich>=13.7,<15.0",
     "pyperclip>=1.9,<2.0",
 ]
+gui = [
+    "spider[cli]",
+    "PySide6-Essentials>=6.7,<7.0",
+]
 dev = [
     "pytest>=8.2,<9.0",
     "pytest-cov>=5.0,<7.0",
@@ -30,6 +34,7 @@ dev = [
 
 [project.scripts]
 spider = "spider.cli.main:app"
+spider-gui = "spider.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
