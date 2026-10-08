@@ -37,8 +37,15 @@ def test_schema_has_the_expected_columns(store):
     finally:
         connection.close()
     assert columns == {
-        "id", "kind", "name", "size", "sha256",
-        "content_type", "created_at", "source_device", "preview",
+        "id",
+        "kind",
+        "name",
+        "size",
+        "sha256",
+        "content_type",
+        "created_at",
+        "source_device",
+        "preview",
     }
 
 
@@ -72,7 +79,6 @@ def test_connect_returns_a_usable_connection(store):
         assert connection.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
     finally:
         connection.close()
-
 
 
 def chunks(payload: bytes, size: int = 7):

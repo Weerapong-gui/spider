@@ -95,9 +95,7 @@ def test_saving_over_a_wide_file_narrows_it_before_writing(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('server = "old"\n', encoding="utf-8")
     path.chmod(0o644)
-    save_client_config(
-        ClientConfig(server="http://x:8181", token=GOOD_TOKEN, device="d"), path
-    )
+    save_client_config(ClientConfig(server="http://x:8181", token=GOOD_TOKEN, device="d"), path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 

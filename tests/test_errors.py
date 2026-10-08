@@ -70,11 +70,7 @@ def _resolve_imports(source: str, module_parts: tuple[str, ...]) -> set[str]:
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            anchor = (
-                list(package[: max(0, len(package) - (node.level - 1))])
-                if node.level
-                else []
-            )
+            anchor = list(package[: max(0, len(package) - (node.level - 1))]) if node.level else []
             base = [*anchor, *(node.module.split(".") if node.module else [])]
             if base:
                 names.add(".".join(base))
@@ -116,9 +112,21 @@ def test_cli_never_imports_server():
 def test_core_uses_no_third_party_dependency_except_pydantic():
     own = {"spider", "pydantic"}
     stdlib_ok = {
-        "os", "time", "enum", "datetime", "pathlib", "tomllib", "typing",
-        "dataclasses", "sys", "shutil", "socket", "stat", "collections",
-        "threading", "__future__",
+        "os",
+        "time",
+        "enum",
+        "datetime",
+        "pathlib",
+        "tomllib",
+        "typing",
+        "dataclasses",
+        "sys",
+        "shutil",
+        "socket",
+        "stat",
+        "collections",
+        "threading",
+        "__future__",
     }
     offenders = set()
     for name in _all_imports("core"):
