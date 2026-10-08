@@ -86,6 +86,30 @@ spider verify                check every item still has its file
 Exit codes: 3 unauthorized, 4 not found, 5 ambiguous id, 6 checksum
 mismatch, 7 disk full, 8 server unreachable.
 
+## Desktop app (Linux and macOS)
+
+A window with the same list, plus a tray icon:
+
+```bash
+pip install "git+https://github.com/Weerapong-gui/spider.git#egg=spider[gui]"
+spider-gui
+```
+
+The first launch asks for the server address and token (the same values as
+`spider init`; both share `~/.config/spider/config.toml`).
+
+- **Send clipboard** / **Paste latest**: the `spider copy` / `spider paste` pair
+- **Send files…**, or drop files onto the window
+- Double-click a text item to put it on the clipboard, a file to save it
+  (checksum verified, written to a `.part` file first)
+- Right-click for Copy, Save as…, Delete
+- Closing the window keeps spider running in the tray; Quit is in the tray
+  menu and under File. Where no tray exists (some Wayland sessions), closing
+  the window quits.
+
+Not included: a global hotkey. macOS needs an Accessibility permission for
+one and Wayland forbids them, so it is left out rather than half-working.
+
 ## Browser
 
 Open `http://<server>:8181`, enter the token once. Drop files anywhere on
@@ -96,8 +120,8 @@ clipboard — including images, which the CLI does not handle.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e ".[server,cli,dev]"
-.venv/bin/pytest -m "not slow"
+.venv/bin/pip install -e ".[server,cli,gui,dev]"
+QT_QPA_PLATFORM=offscreen .venv/bin/pytest -m "not slow"
 .venv/bin/ruff check src tests
 ```
 
