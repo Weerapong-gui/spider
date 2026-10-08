@@ -152,6 +152,10 @@ class SpiderClient:
         with self._http.stream(
             "GET", f"/api/items/{item.id}/content", headers={"Accept": "*/*"}
         ) as response:
+            if not response.is_success:
+                # A streamed response has no body until it is read, and the
+                # error payload is in the body.
+                response.read()
             self._raise_for_error(response)
             for chunk in response.iter_bytes(_DOWNLOAD_CHUNK):
                 destination.write(chunk)
