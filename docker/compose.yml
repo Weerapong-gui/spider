@@ -1,0 +1,26 @@
+services:
+  spider:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: spider:local
+    container_name: spider
+    restart: unless-stopped
+    # Bound to one interface on purpose. Writing "8181:8181" would publish this
+    # on every interface of a machine that already has internet-facing tunnels.
+    ports:
+      - "${SPIDER_BIND_IP:?set SPIDER_BIND_IP to the Tailscale address}:8181:8181"
+    volumes:
+      - "${SPIDER_HOST_DATA_DIR:?set SPIDER_HOST_DATA_DIR to a real path}:/data"
+    environment:
+      SPIDER_TOKEN: "${SPIDER_TOKEN:?set SPIDER_TOKEN to a value of at least 32 characters}"
+      SPIDER_DATA_DIR: /data
+      SPIDER_MIN_FREE_GB: "${SPIDER_MIN_FREE_GB:-10}"
+      SPIDER_MAX_ITEM_MB: "${SPIDER_MAX_ITEM_MB:-0}"
+    user: "${SPIDER_UID:-1000}:${SPIDER_GID:-1000}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8181/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
