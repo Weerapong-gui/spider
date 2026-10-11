@@ -61,7 +61,7 @@ veto files = /.spider/
 ## Client
 
 ```bash
-pip install "git+https://github.com/Weerapong-gui/spider.git#egg=spider[cli]"
+pip install "spider[cli] @ git+https://github.com/Weerapong-gui/spider.git"
 spider init
 ```
 
@@ -95,7 +95,7 @@ mismatch, 7 disk full, 8 server unreachable.
 A window with the same list, plus a tray icon:
 
 ```bash
-pip install "git+https://github.com/Weerapong-gui/spider.git#egg=spider[gui]"
+pip install "spider[gui] @ git+https://github.com/Weerapong-gui/spider.git"
 spider-gui
 ```
 
