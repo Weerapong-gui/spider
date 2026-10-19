@@ -321,6 +321,20 @@ def test_a_failed_ack_keeps_what_was_acked_and_leaves_the_rest(api, other_api, m
     assert len(second.notices) == 1 and second.notices[0].item_ids != acked
 
 
+def test_poll_asks_for_the_device_list_once(transport):
+    seen = []
+
+    class Counting(httpx.BaseTransport):
+        def handle_request(self, request):
+            seen.append(f"{request.method} {request.url.path}")
+            return transport.handle_request(request)
+
+    config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
+    with SpiderClient(config, transport=Counting()) as client:
+        actions.poll(client)
+    assert seen == ["POST /api/devices/heartbeat", "GET /api/devices", "GET /api/inbox"]
+
+
 def test_poll_against_an_old_server_returns_no_devices():
     config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
     old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))

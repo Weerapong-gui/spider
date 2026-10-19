@@ -211,8 +211,11 @@ class SpiderClient:
         """False against a server that predates the device endpoints."""
         return self._request("GET", "/api/devices", allow_404=True).status_code != 404
 
-    def heartbeat(self) -> None:
-        self._request("POST", "/api/devices/heartbeat")
+    def heartbeat(self) -> bool:
+        """False against a server that predates devices, so a poll can find that out
+        without a request of its own (this route never answers 404 otherwise)."""
+        response = self._request("POST", "/api/devices/heartbeat", allow_404=True)
+        return response.status_code != 404
 
     def stop_heartbeat(self) -> None:
         self._request("DELETE", "/api/devices/heartbeat")

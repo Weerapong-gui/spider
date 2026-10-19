@@ -221,10 +221,12 @@ class Poll:
 
 def poll(client: SpiderClient) -> Poll:
     """One heartbeat round. `devices` is None against an old server, which answers
-    the new routes with a plain 404 (mapped to `unreachable`, not `not_found`)."""
-    if not client.supports_devices():
+    the new routes with a plain 404 (mapped to `unreachable`, not `not_found`).
+
+    The heartbeat doubles as the probe for an old server, and goes first so this
+    device is already online in the list it fetches."""
+    if not client.heartbeat():
         return Poll(None, [])
-    client.heartbeat()
     devices = client.devices()
     acked: list[Item] = []
     for item in client.inbox():
