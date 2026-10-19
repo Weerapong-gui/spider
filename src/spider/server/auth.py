@@ -37,9 +37,13 @@ def bearer_from_header(header: str | None) -> str | None:
 def make_auth_dependency(token: str) -> Callable[[Request], None]:
     def require_auth(request: Request) -> None:
         given = bearer_from_header(request.headers.get("authorization"))
+        method = "bearer"
         if given is None:
             given = request.cookies.get(SESSION_COOKIE)
+            method = "cookie"
         if not token_matches(token, given):
             raise SpiderError(ErrorCode.unauthorized, "Missing or invalid token.")
+        # Routes need to know a browser (cookie) from the CLI/GUI (bearer).
+        request.state.auth_method = method
 
     return require_auth

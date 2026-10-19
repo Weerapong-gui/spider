@@ -140,7 +140,7 @@ function renderItem(item) {
     const copy = document.createElement("button");
     copy.textContent = "Copy";
     copy.addEventListener("click", async () => {
-      const response = await api(`/api/items/${item.id}/content`);
+      const response = await api(`/api/items/${item.id}/content?purpose=clipboard`);
       try {
         await copyToClipboard(await response.text());
         copy.textContent = "Copied";

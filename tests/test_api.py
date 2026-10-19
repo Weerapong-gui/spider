@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from spider.core.config import MIN_TOKEN_LENGTH
 from spider.core.errors import ErrorCode, SpiderError
+from spider.core.models import decode_device, encode_device
 from spider.server.app import create_app, create_app_from_env
 from spider.server.auth import SESSION_COOKIE, bearer_from_header, token_matches
 from spider.server.routes import _chunks, is_inline_safe
@@ -108,11 +109,11 @@ def test_create_app_from_env_builds_a_working_app(tmp_path):
         assert test_client.get("/healthz").status_code == 200
 
 
-def upload(client, payload: bytes, *, name="thing.bin", kind="file", **fields):
+def upload(client, payload: bytes, *, name="thing.bin", kind="file", headers=AUTH, **fields):
     data = {"kind": kind, "name": name, "device": "test-device", **fields}
     return client.post(
         "/api/items",
-        headers=AUTH,
+        headers=headers,
         files={"content": (name, payload, "application/octet-stream")},
         data=data,
     )
@@ -434,3 +435,204 @@ def test_static_assets_are_served(client):
 def test_the_page_needs_no_token(client):
     """The page itself must load so the visitor can type their token into it."""
     assert client.get("/").status_code == 200
+
+
+H = {**AUTH, "X-Spider-Device": encode_device("mac"), "X-Spider-Client": "gui"}
+
+
+def _png() -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (200, 100), "red").save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def _devices(client):
+    return {d["name"]: d for d in client.get("/api/devices", headers=AUTH).json()}
+
+
+def _other(client, name="pc"):
+    headers = {**AUTH, "X-Spider-Device": encode_device(name), "X-Spider-Client": "cli"}
+    client.get("/api/items", headers=headers)
+    return headers
+
+
+def test_any_request_with_a_device_header_registers_the_device(client):
+    client.get("/api/items", headers=H)
+    device = _devices(client)["mac"]
+    assert device["client"] == "gui" and not device["online"]
+
+
+def test_unknown_client_header_falls_back_to_cli_and_browser_cannot_be_claimed(client):
+    for value in ("toaster", "browser"):
+        client.get(
+            "/api/items",
+            headers={**H, "X-Spider-Client": value},
+        )
+        assert _devices(client)["mac"]["client"] == "cli"
+
+
+def test_requests_without_a_device_header_register_nothing(client):
+    client.get("/api/items", headers=AUTH)
+    assert _devices(client) == {}
+
+
+def test_cookie_requests_never_register_a_device(client):
+    client.cookies.set(SESSION_COOKIE, TOKEN)
+    client.get("/api/items", headers={"X-Spider-Device": "mac"})
+    assert _devices(client) == {}
+
+
+def test_thai_device_name_roundtrips(client):
+    name = "เครื่องบ้าน"
+    assert decode_device(encode_device(name)) == name
+    hdr = {**AUTH, "X-Spider-Device": encode_device(name), "X-Spider-Client": "gui"}
+    client.post("/api/devices/heartbeat", headers=hdr)
+    item = upload(client, b"x", headers=H, to_device=name).json()
+    assert [i["id"] for i in client.get("/api/inbox", headers=hdr).json()] == [item["id"]]
+    assert _devices(client)[name]["online"]
+
+
+def test_heartbeat_then_delete_goes_offline(client):
+    assert client.post("/api/devices/heartbeat", headers=H).status_code == 204
+    assert _devices(client)["mac"]["online"]
+    assert client.delete("/api/devices/heartbeat", headers=H).status_code == 204
+    assert not _devices(client)["mac"]["online"]
+
+
+def test_heartbeat_without_device_header_is_400(client):
+    for method in (client.post, client.delete):
+        response = method("/api/devices/heartbeat", headers=AUTH)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "bad_request"
+
+
+def test_upload_to_an_unknown_device_is_400_and_names_known_devices(client):
+    client.get("/api/items", headers=H)
+    response = upload(client, b"x", headers=H, to_device="nope")
+    assert response.status_code == 400
+    assert "mac" in response.json()["error"]["message"]
+
+
+def test_upload_to_yourself_is_400(client):
+    client.get("/api/items", headers=H)
+    assert upload(client, b"x", headers=H, to_device="mac").status_code == 400
+
+
+def test_upload_to_a_known_device_without_a_header_is_accepted(client):
+    client.get("/api/items", headers=H)
+    response = upload(client, b"x", to_device="mac")
+    assert response.status_code == 201 and response.json()["to_device"] == "mac"
+
+
+def test_inbox_requires_a_device_header(client):
+    assert client.get("/api/inbox", headers=AUTH).status_code == 400
+
+
+def test_inbox_ack_hides_the_item(client):
+    client.get("/api/items", headers=H)
+    pc = _other(client)
+    item = upload(client, b"x", headers=pc, to_device="mac").json()
+    assert [i["id"] for i in client.get("/api/inbox", headers=H).json()] == [item["id"]]
+    assert client.post(f"/api/inbox/{item['id']}/ack", headers=H).status_code == 204
+    assert client.post(f"/api/inbox/{item['id']}/ack", headers=H).status_code == 204
+    assert client.get("/api/inbox", headers=H).json() == []
+
+
+def test_ack_from_another_device_is_404(client):
+    client.get("/api/items", headers=H)
+    pc = _other(client)
+    item = upload(client, b"x", headers=pc, to_device="mac").json()
+    assert client.post(f"/api/inbox/{item['id']}/ack", headers=pc).status_code == 404
+    assert client.post(f"/api/inbox/{item['id']}/ack", headers=AUTH).status_code == 400
+
+
+def test_history_lists_reported_downloads(client):
+    item = upload(client, b"x").json()
+    url = f"/api/items/{item['id']}/downloads"
+    assert client.post(url, headers=H, json={"destination": "/home/me/x"}).status_code == 204
+    history = client.get(f"/api/items/{item['id']}/history", headers=AUTH).json()
+    assert history["item"]["id"] == item["id"]
+    [download] = history["downloads"]
+    assert (download["device"], download["client"], download["destination"]) == (
+        "mac",
+        "gui",
+        "/home/me/x",
+    )
+
+
+def test_report_download_without_device_is_400(client):
+    item = upload(client, b"x").json()
+    response = client.post(
+        f"/api/items/{item['id']}/downloads", headers=AUTH, json={"destination": "stdout"}
+    )
+    assert response.status_code == 400
+
+
+def test_report_download_for_a_missing_item_is_404(client):
+    response = client.post("/api/items/nope/downloads", headers=H, json={"destination": "x"})
+    assert response.status_code == 404
+
+
+def _downloads(client, item_id):
+    return client.get(f"/api/items/{item_id}/history", headers=AUTH).json()["downloads"]
+
+
+def test_browser_attachment_is_recorded_with_ip(client):
+    item = upload(client, b"x").json()
+    client.cookies.set(SESSION_COOKIE, TOKEN)
+    assert client.get(f"/api/items/{item['id']}/content").status_code == 200
+    [download] = client.get(f"/api/items/{item['id']}/history").json()["downloads"]
+    assert download["device"] == "browser" and download["client"] == "browser"
+    assert download["destination"] and "clipboard" not in download["destination"]
+
+
+def test_browser_inline_is_not_recorded(client):
+    item = upload(client, b"x").json()
+    client.cookies.set(SESSION_COOKIE, TOKEN)
+    client.get(f"/api/items/{item['id']}/content?disposition=inline")
+    assert client.get(f"/api/items/{item['id']}/history").json()["downloads"] == []
+
+
+def test_browser_copy_is_recorded_as_clipboard(client):
+    item = upload(client, b"x", kind="text").json()
+    client.cookies.set(SESSION_COOKIE, TOKEN)
+    client.get(f"/api/items/{item['id']}/content?purpose=clipboard")
+    [download] = client.get(f"/api/items/{item['id']}/history").json()["downloads"]
+    assert download["destination"].startswith("clipboard (")
+
+
+def test_bearer_download_is_never_recorded_as_browser(client):
+    item = upload(client, b"x").json()
+    client.get(f"/api/items/{item['id']}/content", headers=AUTH)
+    client.get(f"/api/items/{item['id']}/content", headers=H)
+    assert _downloads(client, item["id"]) == []
+
+
+def test_thumbnail_endpoint_returns_png_or_404(client):
+    image = client.post(
+        "/api/items",
+        headers=AUTH,
+        files={"content": ("p.png", _png(), "image/png")},
+        data={"kind": "file", "name": "p.png"},
+    ).json()
+    response = client.get(f"/api/items/{image['id']}/thumbnail", headers=AUTH)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG")
+    other = upload(client, b"plain").json()
+    assert client.get(f"/api/items/{other['id']}/thumbnail", headers=AUTH).status_code == 404
+    assert client.get("/api/items/nope/thumbnail", headers=AUTH).status_code == 404
+
+
+def test_remove_device_is_204_then_404(client):
+    client.get("/api/items", headers=H)
+    assert client.delete("/api/devices/mac", headers=AUTH).status_code == 204
+    assert client.delete("/api/devices/mac", headers=AUTH).status_code == 404
+    assert "mac" not in _devices(client)
+
+
+def test_new_endpoints_need_a_token(client):
+    for path in ("/api/devices", "/api/inbox"):
+        assert client.get(path).status_code == 401

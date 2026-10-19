@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Annotated, BinaryIO
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import Item, ItemKind, ItemPage
+from spider.core.models import (
+    BROWSER_DEVICE,
+    CLIENT_HEADER,
+    DEVICE_HEADER,
+    ClientKind,
+    Device,
+    Item,
+    ItemHistory,
+    ItemKind,
+    ItemPage,
+    decode_device,
+)
 from spider.server.auth import SESSION_COOKIE, make_auth_dependency, token_matches
 from spider.server.storage import Storage
 
@@ -22,6 +34,18 @@ _INLINE_EXACT = frozenset({"application/pdf", "text/plain"})
 
 class SessionRequest(BaseModel):
     token: str
+
+
+class DownloadReport(BaseModel):
+    destination: str
+
+
+@dataclass(frozen=True)
+class Caller:
+    """Who is making this request. `device` is None for browsers and old clients."""
+
+    device: str | None
+    client: ClientKind
 
 
 def _chunks(handle: BinaryIO, size: int = _CHUNK, limit: int = 0) -> Iterator[bytes]:
@@ -68,7 +92,37 @@ def content_disposition(name: str, inline: bool) -> str:
 
 def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[APIRouter]:
     require_auth = make_auth_dependency(token)
-    router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
+
+    def caller(request: Request) -> None:
+        """Work out who is calling and note the device as seen.
+
+        Listed after `require_auth` on the router, which sets `auth_method`; a
+        browser is a request that authenticated with the session cookie.
+        """
+        if request.state.auth_method == "cookie":
+            who = Caller(None, ClientKind.browser)
+        else:
+            raw = request.headers.get(DEVICE_HEADER)
+            name = decode_device(raw).strip() if raw else ""
+            try:
+                client = ClientKind(request.headers.get(CLIENT_HEADER, ""))
+            except ValueError:
+                client = ClientKind.cli
+            # A bearer caller cannot claim to be a browser.
+            if client is ClientKind.browser:
+                client = ClientKind.cli
+            who = Caller(name or None, client)
+            if who.device:
+                storage.touch_device(who.device, who.client)
+        request.state.caller = who
+
+    router = APIRouter(prefix="/api", dependencies=[Depends(require_auth), Depends(caller)])
+
+    def need_device(request: Request) -> str:
+        device = request.state.caller.device
+        if not device:
+            raise SpiderError(ErrorCode.bad_request, f"The {DEVICE_HEADER} header is required.")
+        return device
 
     # Declared with `def`, not `async def`: FastAPI then runs it in a worker
     # thread, where the synchronous file and sqlite3 calls below are safe.
@@ -80,7 +134,17 @@ def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[API
         name: Annotated[str | None, Form()] = None,
         sha256: Annotated[str | None, Form()] = None,
         device: Annotated[str, Form()] = "unknown",
+        to_device: Annotated[str | None, Form()] = None,
     ) -> Item:
+        if to_device:
+            known = storage.device_names()
+            if to_device not in known:
+                raise SpiderError(
+                    ErrorCode.bad_request,
+                    f"Unknown device {to_device!r}. Known devices: {', '.join(known) or 'none'}.",
+                )
+            if to_device == request.state.caller.device:
+                raise SpiderError(ErrorCode.bad_request, "You cannot send to your own device.")
         limit = max_item_mb * 1024 * 1024 if max_item_mb > 0 else 0
         if limit:
             declared = request.headers.get("content-length", "")
@@ -103,6 +167,7 @@ def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[API
             content_type=content_type,
             source_device=device,
             expected_sha256=sha256,
+            to_device=to_device or None,
         )
 
     @router.get("/items", response_model=ItemPage)
@@ -114,6 +179,37 @@ def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[API
     ) -> ItemPage:
         return storage.list_items(limit=limit, before=before, q=q, kind=kind)
 
+    # Literal paths: declared before the parameterised /devices/{name} so
+    # "heartbeat" is never taken for a device name.
+    @router.post("/devices/heartbeat", status_code=204)
+    def beat(request: Request) -> Response:
+        storage.heartbeat(need_device(request))
+        return Response(status_code=204)
+
+    @router.delete("/devices/heartbeat", status_code=204)
+    def stop_beat(request: Request) -> Response:
+        storage.clear_heartbeat(need_device(request))
+        return Response(status_code=204)
+
+    @router.get("/devices", response_model=list[Device])
+    def list_devices() -> list[Device]:
+        return storage.list_devices()
+
+    @router.delete("/devices/{name}", status_code=204)
+    def remove_device(name: str) -> Response:
+        storage.remove_device(name)
+        return Response(status_code=204)
+
+    @router.get("/inbox", response_model=list[Item])
+    def inbox(request: Request) -> list[Item]:
+        return storage.inbox(need_device(request))
+
+    @router.post("/inbox/{ref}/ack", status_code=204)
+    def ack(ref: str, request: Request) -> Response:
+        device = need_device(request)
+        storage.ack(storage.resolve(ref).id, device)
+        return Response(status_code=204)
+
     # Registered before /items/{ref} only by convention; the paths differ, but
     # keeping literal routes first means a future /items/verify cannot be shadowed.
     @router.get("/verify")
@@ -124,11 +220,37 @@ def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[API
     def get_item(ref: str) -> Item:
         return storage.resolve(ref)
 
+    @router.get("/items/{ref}/history", response_model=ItemHistory)
+    def get_history(ref: str) -> ItemHistory:
+        return storage.history(storage.resolve(ref).id)
+
+    @router.post("/items/{ref}/downloads", status_code=204)
+    def report_download(ref: str, body: DownloadReport, request: Request) -> Response:
+        device = need_device(request)
+        item = storage.resolve(ref)
+        storage.record_download(item.id, device, request.state.caller.client, body.destination)
+        return Response(status_code=204)
+
+    @router.get("/items/{ref}/thumbnail")
+    def get_thumbnail(ref: str) -> FileResponse:
+        path = storage.thumbnail(storage.resolve(ref).id)
+        if path is None:
+            raise SpiderError(ErrorCode.not_found, "No thumbnail for this item.")
+        return FileResponse(path, media_type="image/png")
+
     @router.get("/items/{ref}/content")
     def get_content(
-        ref: str, disposition: Annotated[str, Query()] = "attachment"
+        ref: str,
+        request: Request,
+        disposition: Annotated[str, Query()] = "attachment",
+        purpose: Annotated[str | None, Query()] = None,
     ) -> StreamingResponse:
         item = storage.resolve(ref)
+        if request.state.caller.client is ClientKind.browser and disposition != "inline":
+            # Recorded when the send starts: only the browser knows if it finished.
+            ip = request.client.host if request.client else "unknown"
+            destination = f"clipboard ({ip})" if purpose == "clipboard" else ip
+            storage.record_download(item.id, BROWSER_DEVICE, ClientKind.browser, destination)
         handle = storage.open_blob(item.id)
         inline = disposition == "inline" and is_inline_safe(item.content_type)
 
