@@ -480,3 +480,28 @@ def test_quit_clears_the_heartbeat(window, store):
     window.quit_for_real()
     QThreadPool.globalInstance().waitForDone(5000)
     assert [d.online for d in store.list_devices() if d.name == "gui-test"] == [False]
+
+
+def test_a_second_click_while_receiving_does_not_fetch_again(window, other, tmp_path, monkeypatch):
+    downloads = tmp_path / "Downloads"
+    monkeypatch.setattr(actions, "downloads_dir", lambda: downloads)
+    calls = []
+    real_receive = actions.receive
+
+    def counting_receive(client, item_id, target):
+        calls.append(item_id)
+        return real_receive(client, item_id, target)
+
+    # Two workers racing on one file can hide each other's output, so count the calls.
+    monkeypatch.setattr(actions, "receive", counting_receive)
+    known(window)
+    item = other.push_bytes(b"once", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    window.receive_notice(window._last_notice)
+    window._notice_clicked()
+    settle(window, lambda: not banner_texts(window))
+    QThreadPool.globalInstance().waitForDone(5000)
+    assert calls == [item.id]
+    assert [path.name for path in downloads.iterdir()] == ["r.pdf"]
+    assert len(other.history(item.id).downloads) == 1

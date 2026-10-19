@@ -225,6 +225,9 @@ class MainWindow(QMainWindow):
         # on the server, so the banner and the tray menu are the only way back.
         self._notice_rows: dict[int, NoticeRow] = {}
         self._notice_serial = 0
+        # Notices being received now: the banner, the tray entry and the notification
+        # can each ask again mid-download, which would save a second copy.
+        self._receiving: set[int] = set()
         self._last_notice: actions.Notice | None = None
         self._receive_actions: list[QAction] = []
 
@@ -852,6 +855,9 @@ class MainWindow(QMainWindow):
         """Take every item a notice names: files into Downloads, text onto the clipboard."""
         key = self._notice_key(notice)
         if key is not None:
+            if key in self._receiving:
+                return
+            self._receiving.add(key)
             self._notice_rows[key].action.setEnabled(False)
         item_ids = list(notice.item_ids)
         fallback = notice_name(notice) or "That item"
@@ -871,6 +877,7 @@ class MainWindow(QMainWindow):
 
         def failed(message: str) -> None:
             self._busy = max(0, self._busy - 1)
+            self._receiving.discard(key)
             if key in self._notice_rows:
                 self._notice_rows[key].action.setEnabled(True)  # let them try again
             self.statusBar().showMessage(f"Error: {message}", 15_000)
@@ -878,6 +885,7 @@ class MainWindow(QMainWindow):
 
         def done(outcomes: list[actions.Received | str]) -> None:
             self._busy = max(0, self._busy - 1)
+            self._receiving.discard(key)
             if key is not None:
                 self._drop_notice(key)
             self._received(outcomes, fallback)
