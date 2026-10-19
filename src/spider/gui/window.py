@@ -337,8 +337,10 @@ class MainWindow(QMainWindow):
         target = Path(name)
         self.run_task(
             lambda client: actions.save_item(client, item.id, target),
-            lambda saved: self.statusBar().showMessage(
-                f"Saved {target} ({humanize_size(saved.size)}, sha256 verified)", 10_000
+            lambda result: self.statusBar().showMessage(
+                f"Saved {target} ({humanize_size(result[0].size)}, sha256 verified)"
+                + (f" — {result[1]}" if result[1] else ""),
+                10_000,
             ),
             f"Downloading {item.name}…",
         )

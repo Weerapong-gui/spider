@@ -15,6 +15,7 @@ from spider.core.config import (
     save_client_config,
 )
 from spider.core.errors import SpiderError
+from spider.core.models import ClientKind
 from spider.gui.window import MainWindow, SettingsDialog, make_icon
 
 
@@ -27,7 +28,7 @@ class Session:
     def make_client(self) -> SpiderClient:
         # main() does not open the window until a config exists.
         assert self.config is not None
-        return SpiderClient(self.config)
+        return SpiderClient(self.config, client_kind=ClientKind.gui)
 
     def edit(self, parent: QWidget | None) -> bool:
         dialog = SettingsDialog(self.config, default_device_name(), parent)

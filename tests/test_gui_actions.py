@@ -1,14 +1,16 @@
 """The GUI's button logic, tested against the real app with no display."""
 
 import hashlib
+from datetime import UTC, datetime
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from spider.cli.client import SpiderClient
 from spider.core.config import MIN_TOKEN_LENGTH, ClientConfig
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import ItemKind
+from spider.core.models import Item, ItemKind
 from spider.gui import actions
 from spider.server.app import create_app
 from spider.server.storage import Storage
@@ -24,9 +26,23 @@ def store(tmp_path):
 
 
 @pytest.fixture
-def api(store):
+def transport(store):
+    return TestClient(create_app(store, TOKEN))._transport
+
+
+@pytest.fixture
+def api(transport):
     config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
-    client = SpiderClient(config, transport=TestClient(create_app(store, TOKEN))._transport)
+    client = SpiderClient(config, transport=transport)
+    yield client
+    client.close()
+
+
+@pytest.fixture
+def other_api(transport):
+    """A second machine talking to the same server."""
+    config = ClientConfig(server="http://spider.test", token=TOKEN, device="park-macbook")
+    client = SpiderClient(config, transport=transport)
     yield client
     client.close()
 
@@ -89,7 +105,8 @@ def test_save_item_writes_exact_bytes_and_leaves_no_part_file(api, tmp_path):
     payload = bytes(range(256)) * 10
     pushed = api.push_bytes(payload, kind=ItemKind.file, name="all.bin")
     target = tmp_path / "out" / "all.bin"
-    saved = actions.save_item(api, pushed.id, target)
+    saved, warning = actions.save_item(api, pushed.id, target)
+    assert warning is None
     assert target.read_bytes() == payload
     assert saved.sha256 == hashlib.sha256(payload).hexdigest()
     assert not list(target.parent.glob("*.part"))
@@ -151,3 +168,133 @@ def test_every_icon_name_has_an_svg():
 
 def test_icons_ship_with_a_license():
     assert (actions.ICON_DIR / "LICENSE").is_file()
+
+
+@pytest.mark.parametrize(
+    "existing,name,expected",
+    [
+        ([], "report.pdf", "report.pdf"),
+        (["report.pdf"], "report.pdf", "report (1).pdf"),
+        (["report.pdf", "report (1).pdf"], "report.pdf", "report (2).pdf"),
+        (["a.tar.gz"], "a.tar.gz", "a (1).tar.gz"),
+        (["noext"], "noext", "noext (1)"),
+        ([".bashrc"], ".bashrc", ".bashrc (1)"),
+    ],
+)
+def test_unique_path(tmp_path, existing, name, expected):
+    for each in existing:
+        (tmp_path / each).write_bytes(b"x")
+    assert actions.unique_path(tmp_path, name) == tmp_path / expected
+
+
+def test_receive_saves_into_downloads_without_overwriting(api, tmp_path):
+    (tmp_path / "report.pdf").write_bytes(b"original")
+    pushed = api.push_bytes(b"new bytes", kind=ItemKind.file, name="report.pdf")
+    received = actions.receive(api, pushed.id, tmp_path)
+    assert received.path == tmp_path / "report (1).pdf"
+    assert received.path.read_bytes() == b"new bytes"
+    assert (tmp_path / "report.pdf").read_bytes() == b"original"
+    assert received.text is None
+    assert received.warning is None
+
+
+def test_receive_creates_the_downloads_folder(api, tmp_path):
+    pushed = api.push_bytes(b"x", kind=ItemKind.file, name="a.bin")
+    received = actions.receive(api, pushed.id, tmp_path / "missing")
+    assert received.path == tmp_path / "missing" / "a.bin"
+    assert received.path.is_file()
+
+
+def test_receive_text_returns_text_and_records_clipboard(api, tmp_path):
+    sent = actions.send_text(api, "สวัสดี")
+    downloads = tmp_path / "downloads"
+    received = actions.receive(api, sent.id, downloads)
+    assert received.text == "สวัสดี"
+    assert received.path is None
+    assert [d.destination for d in api.history(sent.id).downloads] == ["clipboard"]
+    assert not downloads.exists()
+
+
+def test_receive_records_the_saved_path_in_history(api, tmp_path):
+    pushed = api.push_bytes(b"x", kind=ItemKind.file, name="a.bin")
+    received = actions.receive(api, pushed.id, tmp_path)
+    downloads = api.history(pushed.id).downloads
+    assert [d.destination for d in downloads] == [str(received.path.resolve())]
+    assert downloads[0].device == "gui-test"
+
+
+def test_receive_of_a_deleted_item_raises_not_found(api, tmp_path):
+    pushed = api.push_bytes(b"x", kind=ItemKind.file, name="a.bin")
+    api.delete(pushed.id)
+    with pytest.raises(SpiderError) as caught:
+        actions.receive(api, pushed.id, tmp_path)
+    assert caught.value.code is ErrorCode.not_found
+
+
+def test_a_failed_report_does_not_fail_the_save(api, tmp_path, monkeypatch):
+    def refuse(item_id, destination):
+        raise SpiderError(ErrorCode.unreachable, "history is down")
+
+    monkeypatch.setattr(api, "report_download", refuse)
+    pushed = api.push_bytes(b"keep me", kind=ItemKind.file, name="a.bin")
+    received = actions.receive(api, pushed.id, tmp_path)
+    assert received.path.read_bytes() == b"keep me"
+    assert "history is down" in received.warning
+
+
+def _item(name, kind, source, size=10) -> Item:
+    return Item(
+        id=f"id-{name}",
+        kind=kind,
+        name=name,
+        size=size,
+        sha256="0" * 64,
+        content_type="application/octet-stream",
+        created_at=datetime.now(UTC),
+        source_device=source,
+    )
+
+
+def test_group_notices_groups_files_but_not_texts():
+    items = [
+        _item("a.pdf", ItemKind.file, "park-macbook"),
+        _item("note one", ItemKind.text, "park-macbook"),
+        _item("b.pdf", ItemKind.file, "park-macbook"),
+        _item("note two", ItemKind.text, "park-macbook"),
+        _item("c.pdf", ItemKind.file, "park-macbook"),
+    ]
+    notices = actions.group_notices(items)
+    assert len(notices) == 3
+    files = next(n for n in notices if len(n.item_ids) == 3)
+    assert files.message == "3 files from park-macbook — click to receive all"
+    assert files.title == "spider · from park-macbook"
+    assert sum(1 for n in notices if len(n.item_ids) == 1) == 2
+
+
+def test_group_notices_single_file_and_sender_order():
+    items = [
+        _item("x.bin", ItemKind.file, "zeta", size=1),
+        _item("y.bin", ItemKind.file, "alpha", size=2048),
+        _item("z.bin", ItemKind.file, "alpha", size=1),
+    ]
+    notices = actions.group_notices(items)
+    assert [n.title for n in notices] == ["spider · from zeta", "spider · from alpha"]
+    assert notices[0].message == "x.bin (1 B) — click to save to Downloads"
+    assert notices[1].message == "2 files from alpha — click to receive all"
+
+
+def test_poll_acks_so_the_next_poll_is_empty(api, other_api):
+    api.heartbeat()
+    other_api.push_bytes(b"x", kind=ItemKind.file, name="report.pdf", to_device="gui-test")
+    first = actions.poll(api)
+    assert {d.name for d in first.devices} >= {"gui-test"}
+    assert [n.message.split(" — ")[1] for n in first.notices] == ["click to save to Downloads"]
+    assert first.notices[0].title == "spider · from park-macbook"
+    assert actions.poll(api).notices == []
+
+
+def test_poll_against_an_old_server_returns_no_devices():
+    config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
+    old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))
+    client = SpiderClient(config, transport=old)
+    assert actions.poll(client) == actions.Poll(None, [])
