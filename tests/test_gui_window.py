@@ -2,6 +2,7 @@
 
 import io
 import os
+import threading
 import time
 
 import pytest
@@ -45,9 +46,25 @@ def store(tmp_path):
     return storage
 
 
+class Serialized(httpx.BaseTransport):
+    """One request at a time through the shared TestClient bridge.
+
+    The window's workers run on several pool threads at once, and the bridge is
+    not thread-safe: concurrent requests now and then fail with anyio's
+    ClosedResourceError. The real server has no such limit, so the tests take turns."""
+
+    def __init__(self, real: httpx.BaseTransport) -> None:
+        self._real = real
+        self._lock = threading.Lock()
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        with self._lock:
+            return self._real.handle_request(request)
+
+
 @pytest.fixture
 def transport(store):
-    return TestClient(create_app(store, TOKEN))._transport
+    return Serialized(TestClient(create_app(store, TOKEN))._transport)
 
 
 def make_window(transport):
@@ -288,8 +305,6 @@ def test_settings_dialog_strips_pasted_whitespace(qapp):
 def test_callbacks_run_on_the_ui_thread(window):
     """Widgets may only be touched from the UI thread; a bare lambda connected
     to a worker's signal would run on the worker thread instead."""
-    import threading
-
     seen = []
     window.run_task(
         lambda client: client.list_items(),
@@ -428,7 +443,6 @@ def test_an_item_sent_here_shows_a_banner_once(window, other):
 def test_overlapping_refreshes_never_lose_or_repeat_a_notice(window, other, monkeypatch):
     """The poll acks what it fetches, so a refresh must never discard a poll's
     notices or let a second poll race it for the same inbox."""
-    import threading
 
     lock = threading.Lock()
     running, most = [0], [0]
@@ -574,6 +588,19 @@ def test_quit_clears_the_heartbeat(window, store):
     window.quit_for_real()
     QThreadPool.globalInstance().waitForDone(5000)
     assert [d.online for d in store.list_devices() if d.name == "gui-test"] == [False]
+
+
+def test_no_poll_starts_after_quitting(window, monkeypatch):
+    """A heartbeat after quitting would undo the one quitting just cleared."""
+    calls = []
+    monkeypatch.setattr(actions, "poll", lambda client: calls.append(client))
+    window.quit_for_real()
+    window.refresh()
+    window._start_poll()
+    QThreadPool.globalInstance().waitForDone(5000)
+    QCoreApplication.processEvents()
+    assert calls == []
+    assert not window._polling
 
 
 def test_a_second_click_while_receiving_does_not_fetch_again(window, other, tmp_path, monkeypatch):
