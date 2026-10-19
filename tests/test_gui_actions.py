@@ -120,3 +120,32 @@ def test_list_and_delete(api):
     assert [i.id for i in actions.list_items(api, "invoice")] == [first.id]
     actions.delete_item(api, first.id)
     assert [i.name for i in actions.list_items(api, None)] == ["unrelated"]
+
+
+@pytest.mark.parametrize(
+    "name,ctype,kind,expected",
+    [
+        ("a.py", "text/x-python", ItemKind.file, "python"),
+        ("b.tar.gz", "application/gzip", ItemKind.file, "zip"),
+        ("c.JPG", "image/jpeg", ItemKind.file, "image"),
+        ("noext", "audio/mpeg", ItemKind.file, "audio"),
+        ("notes", "text/plain; charset=utf-8", ItemKind.text, "text"),
+        ("x.weird", "application/octet-stream", ItemKind.file, "file"),
+    ],
+)
+def test_icon_name(name, ctype, kind, expected):
+    assert actions.icon_name(name, ctype, kind) == expected
+
+
+def test_every_icon_name_has_an_svg():
+    for stem in {
+        *actions.ICON_BY_EXTENSION.values(),
+        *actions.ICON_BY_FAMILY.values(),
+        "text",
+        "file",
+    }:
+        assert (actions.ICON_DIR / f"{stem}.svg").is_file(), stem
+
+
+def test_icons_ship_with_a_license():
+    assert (actions.ICON_DIR / "LICENSE").is_file()

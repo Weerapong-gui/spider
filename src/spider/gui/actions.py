@@ -17,6 +17,36 @@ from spider.core.models import Item, ItemKind
 
 TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
 LIST_LIMIT = 200
+ICON_DIR = Path(__file__).parent / "icons"
+
+# Material Icon Theme (MIT) stems in ICON_DIR. Extension wins because the content
+# type is often a generic guess; the family is the fallback for extensionless names.
+ICON_BY_EXTENSION = {
+    **dict.fromkeys(("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "tiff"), "image"),
+    "pdf": "pdf",
+    "txt": "text",
+    "log": "text",
+    "md": "markdown",
+    "py": "python",
+    "js": "javascript",
+    "mjs": "javascript",
+    "ts": "typescript",
+    "html": "html",
+    "htm": "html",
+    "css": "css",
+    "json": "json",
+    "yaml": "yaml",
+    "yml": "yaml",
+    **dict.fromkeys(("sh", "bash", "zsh"), "shell"),
+    **dict.fromkeys(("zip", "tar", "gz", "tgz", "7z", "bz2", "xz", "rar"), "zip"),
+    **dict.fromkeys(("mp3", "wav", "flac", "m4a", "ogg", "aac"), "audio"),
+    **dict.fromkeys(("mp4", "mov", "mkv", "avi", "webm"), "video"),
+    **dict.fromkeys(("doc", "docx"), "word"),
+    **dict.fromkeys(("xls", "xlsx"), "excel"),
+    **dict.fromkeys(("ppt", "pptx"), "powerpoint"),
+    "csv": "csv",
+}
+ICON_BY_FAMILY = {"image": "image", "audio": "audio", "video": "video", "text": "text"}
 
 
 def clipboard_label(text: str) -> str:
@@ -90,3 +120,14 @@ def list_items(client: SpiderClient, query: str | None) -> list[Item]:
 
 def delete_item(client: SpiderClient, item_id: str) -> None:
     client.delete(item_id)
+
+
+def icon_name(name: str, content_type: str, kind: ItemKind) -> str:
+    """Pick the icon stem for a list row: extension, then content-type family."""
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if extension in ICON_BY_EXTENSION:
+        return ICON_BY_EXTENSION[extension]
+    family = content_type.split("/", 1)[0].strip().lower()
+    if family in ICON_BY_FAMILY:
+        return ICON_BY_FAMILY[family]
+    return "text" if kind is ItemKind.text else "file"
