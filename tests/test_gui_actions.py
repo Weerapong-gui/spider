@@ -335,9 +335,16 @@ def test_poll_asks_for_the_device_list_once(transport):
     assert seen == ["POST /api/devices/heartbeat", "GET /api/devices", "GET /api/inbox"]
 
 
+def old_server(request: httpx.Request) -> httpx.Response:
+    """An old server's static mount: a plain-text 404 to GET, 405 to anything else."""
+    if request.method in ("GET", "HEAD"):
+        return httpx.Response(404, text="Not Found")
+    return httpx.Response(405, text="Method Not Allowed")
+
+
 def test_poll_against_an_old_server_returns_no_devices():
     config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
-    old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))
+    old = httpx.MockTransport(old_server)
     client = SpiderClient(config, transport=old)
     assert actions.poll(client) == actions.Poll(None, [])
 
@@ -360,7 +367,7 @@ def test_load_history_lists_the_downloads(api):
 
 def test_load_history_is_none_against_an_old_server():
     config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
-    old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))
+    old = httpx.MockTransport(old_server)
     client = SpiderClient(config, transport=old)
     assert actions.load_history(client, "abc") is None
 

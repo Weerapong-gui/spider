@@ -30,6 +30,8 @@ from spider.core.models import (
 
 _DOWNLOAD_CHUNK = 1024 * 1024
 _HASH_CHUNK = 1024 * 1024
+# How a server that predates devices answers a POST to a route it lacks.
+OLD_SERVER = (404, 405)
 
 
 def sha256_of_file(path: Path) -> str:
@@ -83,13 +85,14 @@ class SpiderClient:
         raise SpiderError(code, message)
 
     def _request(
-        self, method: str, url: str, *, allow_404: bool = False, **kwargs
+        self, method: str, url: str, *, allow: tuple[int, ...] = (), **kwargs
     ) -> httpx.Response:
-        """`allow_404` hands a 404 back untouched.
+        """`allow` names error statuses handed back untouched.
 
         An old server answers unknown routes from its static-file mount with a
-        plain-text 404, not the shared error shape, so callers probing for newer
-        endpoints must look at the status rather than the error code.
+        plain-text 404 (405 to anything but GET), not the shared error shape, so
+        callers probing for newer endpoints must look at the status rather than
+        the error code.
         """
         try:
             response = self._http.request(method, url, **kwargs)
@@ -101,7 +104,7 @@ class SpiderClient:
             ) from exc
         except httpx.HTTPError as exc:
             raise SpiderError(ErrorCode.unreachable, f"Network error: {exc}") from exc
-        if not (allow_404 and response.status_code == 404):
+        if response.status_code not in allow:
             self._raise_for_error(response)
         return response
 
@@ -209,13 +212,14 @@ class SpiderClient:
 
     def supports_devices(self) -> bool:
         """False against a server that predates the device endpoints."""
-        return self._request("GET", "/api/devices", allow_404=True).status_code != 404
+        return self._request("GET", "/api/devices", allow=(404,)).status_code != 404
 
     def heartbeat(self) -> bool:
         """False against a server that predates devices, so a poll can find that out
-        without a request of its own (this route never answers 404 otherwise)."""
-        response = self._request("POST", "/api/devices/heartbeat", allow_404=True)
-        return response.status_code != 404
+        without a request of its own. Its static mount refuses the POST with a 405;
+        a current server never answers this route with 404 or 405."""
+        response = self._request("POST", "/api/devices/heartbeat", allow=OLD_SERVER)
+        return response.status_code not in OLD_SERVER
 
     def stop_heartbeat(self) -> None:
         self._request("DELETE", "/api/devices/heartbeat")
@@ -236,5 +240,5 @@ class SpiderClient:
         return ItemHistory.model_validate(self._request("GET", f"/api/items/{ref}/history").json())
 
     def thumbnail(self, item_id: str) -> bytes | None:
-        response = self._request("GET", f"/api/items/{item_id}/thumbnail", allow_404=True)
+        response = self._request("GET", f"/api/items/{item_id}/thumbnail", allow=(404,))
         return None if response.status_code == 404 else response.content

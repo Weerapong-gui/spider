@@ -80,7 +80,7 @@ def other(transport):
 
 class OldServer(httpx.BaseTransport):
     """The real app minus every route this feature added: an old server answers
-    them from its static mount with a plain-text 404."""
+    them from its static mount, with a plain-text 404 to GET and 405 to the rest."""
 
     def __init__(self, real: httpx.BaseTransport) -> None:
         self._real = real
@@ -90,7 +90,9 @@ class OldServer(httpx.BaseTransport):
         if path.startswith(("/api/devices", "/api/inbox")) or path.endswith(
             ("/history", "/thumbnail")
         ):
-            return httpx.Response(404, text="Not Found")
+            if request.method in ("GET", "HEAD"):
+                return httpx.Response(404, text="Not Found")
+            return httpx.Response(405, text="Method Not Allowed")
         return self._real.handle_request(request)
 
 
