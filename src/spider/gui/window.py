@@ -417,13 +417,16 @@ class MainWindow(QMainWindow):
 
     def _polled(self, result: actions.Poll) -> None:
         """Polls never overlap, so each result is the newest; and its notices are
-        acked on the server already, so they are shown whatever else has happened."""
+        acked on the server already, so they go first and are shown whatever else
+        happens, even if drawing the sidebar fails."""
         try:
-            self._server_ok = True
-            self.show_devices(result.devices)
             self._on_notices(result.notices)
         finally:
-            self._poll_finished()  # a rendering error must not stop polling for good
+            try:
+                self._server_ok = True
+                self.show_devices(result.devices)
+            finally:
+                self._poll_finished()  # a rendering error must not stop polling for good
 
     def _poll_failed(self) -> None:
         self._server_ok = False

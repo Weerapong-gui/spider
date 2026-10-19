@@ -466,6 +466,24 @@ def test_overlapping_refreshes_never_lose_or_repeat_a_notice(window, other, monk
     assert most[0] == 1
 
 
+def test_notices_are_shown_even_when_drawing_the_devices_fails(window, other, monkeypatch):
+    """The poll has acked them, so a failure elsewhere must not drop them."""
+    known(window)
+
+    def broken(_devices):
+        raise RuntimeError("cannot draw the sidebar")
+
+    monkeypatch.setattr(window, "show_devices", broken)
+    other.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    with window._make_client() as client:
+        result = actions.poll(client)
+    window._polling = True  # as if the window had started this poll
+    with pytest.raises(RuntimeError):
+        window._polled(result)
+    assert banner_texts(window) == ["r.pdf (1 B) — click to save to Downloads"]
+    assert not window._polling
+
+
 def test_a_notice_already_pending_is_not_shown_again(window, other):
     known(window)
     other.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
