@@ -244,6 +244,30 @@ def test_an_unreachable_server_shows_an_error_instead_of_crashing(qapp):
         win.close()
 
 
+def test_a_timed_out_poll_frees_the_slot_for_the_next_one(qapp, transport):
+    """A stalled request ends in a timeout; the poll must then let the next one run,
+    or heartbeats and notices stop for good."""
+    stalls = [1]
+
+    class StallOnce(httpx.BaseTransport):
+        def handle_request(self, request):
+            if request.url.path == "/api/devices/heartbeat" and stalls:
+                stalls.pop()
+                raise httpx.ReadTimeout("stalled", request=request)
+            return transport.handle_request(request)
+
+    win = make_window(StallOnce())
+    try:
+        win._start_poll()
+        settle(win, lambda: not win._polling)
+        assert win._server_ok is False
+        win.refresh()
+        settle(win, lambda: any(device.name == "gui-test" for device in win._devices))
+        assert win._server_ok is True
+    finally:
+        close_window(win)
+
+
 def test_settings_dialog_rejects_a_short_token(qapp):
     dialog = SettingsDialog(None, "laptop")
     dialog.server.setText("http://x:8181")

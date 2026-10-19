@@ -85,7 +85,13 @@ class SpiderClient:
         raise SpiderError(code, message)
 
     def _request(
-        self, method: str, url: str, *, allow: tuple[int, ...] = (), **kwargs
+        self,
+        method: str,
+        url: str,
+        *,
+        allow: tuple[int, ...] = (),
+        timeout: float | None = None,
+        **kwargs,
     ) -> httpx.Response:
         """`allow` names error statuses handed back untouched.
 
@@ -93,7 +99,13 @@ class SpiderClient:
         plain-text 404 (405 to anything but GET), not the shared error shape, so
         callers probing for newer endpoints must look at the status rather than
         the error code.
+
+        `timeout` bounds every phase of this one request. The client's own default
+        waits forever on reads and writes so a large transfer is never cut off,
+        which a small request that is meant to come back quickly cannot afford.
         """
+        if timeout is not None:
+            kwargs["timeout"] = httpx.Timeout(timeout)
         try:
             response = self._http.request(method, url, **kwargs)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -207,18 +219,21 @@ class SpiderClient:
         payload = self._request("GET", "/api/verify").json()
         return [Item.model_validate(entry) for entry in payload["missing"]]
 
-    def devices(self) -> list[Device]:
-        return [Device.model_validate(d) for d in self._request("GET", "/api/devices").json()]
+    def devices(self, timeout: float | None = None) -> list[Device]:
+        response = self._request("GET", "/api/devices", timeout=timeout)
+        return [Device.model_validate(d) for d in response.json()]
 
     def supports_devices(self) -> bool:
         """False against a server that predates the device endpoints."""
         return self._request("GET", "/api/devices", allow=(404,)).status_code != 404
 
-    def heartbeat(self) -> bool:
+    def heartbeat(self, timeout: float | None = None) -> bool:
         """False against a server that predates devices, so a poll can find that out
         without a request of its own. Its static mount refuses the POST with a 405;
         a current server never answers this route with 404 or 405."""
-        response = self._request("POST", "/api/devices/heartbeat", allow=OLD_SERVER)
+        response = self._request(
+            "POST", "/api/devices/heartbeat", allow=OLD_SERVER, timeout=timeout
+        )
         return response.status_code not in OLD_SERVER
 
     def stop_heartbeat(self) -> None:
@@ -227,11 +242,12 @@ class SpiderClient:
     def remove_device(self, name: str) -> None:
         self._request("DELETE", f"/api/devices/{encode_device(name)}")
 
-    def inbox(self) -> list[Item]:
-        return [Item.model_validate(i) for i in self._request("GET", "/api/inbox").json()]
+    def inbox(self, timeout: float | None = None) -> list[Item]:
+        response = self._request("GET", "/api/inbox", timeout=timeout)
+        return [Item.model_validate(i) for i in response.json()]
 
-    def ack(self, item_id: str) -> None:
-        self._request("POST", f"/api/inbox/{item_id}/ack")
+    def ack(self, item_id: str, timeout: float | None = None) -> None:
+        self._request("POST", f"/api/inbox/{item_id}/ack", timeout=timeout)
 
     def report_download(self, item_id: str, destination: str) -> None:
         self._request("POST", f"/api/items/{item_id}/downloads", json={"destination": destination})

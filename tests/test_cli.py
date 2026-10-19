@@ -186,6 +186,41 @@ def test_a_wrong_token_surfaces_as_unauthorized(store, config):
         wrong.close()
 
 
+def test_a_stalled_poll_call_times_out_as_unreachable(config):
+    """The GUI polls with these four; one that never answers must end, or polling
+    stops for good. A finite timeout is what ends it."""
+    seen = []
+
+    def stall(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        raise httpx.ReadTimeout("stalled", request=request)
+
+    with SpiderClient(config, transport=httpx.MockTransport(stall)) as client:
+        calls = (
+            lambda: client.heartbeat(timeout=15.0),
+            lambda: client.devices(timeout=15.0),
+            lambda: client.inbox(timeout=15.0),
+            lambda: client.ack("x", timeout=15.0),
+        )
+        for call in calls:
+            with pytest.raises(SpiderError) as caught:
+                call()
+            assert caught.value.code is ErrorCode.unreachable
+    assert seen == [dict.fromkeys(("connect", "read", "write", "pool"), 15.0)] * 4
+
+
+def test_without_a_timeout_reads_and_writes_wait_as_long_as_a_transfer_needs(config):
+    seen = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, json=[])
+
+    with SpiderClient(config, transport=httpx.MockTransport(record)) as client:
+        client.devices()
+    assert seen == [{"connect": 30.0, "read": None, "write": None, "pool": 30.0}]
+
+
 def test_an_unreachable_server_surfaces_as_unreachable(config):
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)

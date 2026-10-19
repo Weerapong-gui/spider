@@ -18,6 +18,10 @@ from spider.core.models import Device, Item, ItemHistory, ItemKind
 
 TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
 LIST_LIMIT = 200
+# Every request a poll makes gives up after this long. The window runs one poll at
+# a time, so a request that never answers (a laptop waking from sleep, Tailscale
+# dropping mid-request) would otherwise stop heartbeats and notices for good.
+POLL_TIMEOUT = 15.0
 ICON_DIR = Path(__file__).parent / "icons"
 
 # Material Icon Theme (MIT) stems in ICON_DIR. Extension wins because the content
@@ -225,15 +229,15 @@ def poll(client: SpiderClient) -> Poll:
 
     The heartbeat doubles as the probe for an old server, and goes first so this
     device is already online in the list it fetches."""
-    if not client.heartbeat():
+    if not client.heartbeat(timeout=POLL_TIMEOUT):
         return Poll(None, [])
-    devices = client.devices()
+    devices = client.devices(timeout=POLL_TIMEOUT)
     acked: list[Item] = []
-    for item in client.inbox():
+    for item in client.inbox(timeout=POLL_TIMEOUT):
         # Stop at the first failure but keep what was acked: those are never offered
         # again, so they must reach the window. The rest come back next poll.
         try:
-            client.ack(item.id)
+            client.ack(item.id, timeout=POLL_TIMEOUT)
         except SpiderError:
             break
         acked.append(item)

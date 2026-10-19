@@ -307,10 +307,10 @@ def test_a_failed_ack_keeps_what_was_acked_and_leaves_the_rest(api, other_api, m
     real_ack = api.ack
     acked = []
 
-    def flaky_ack(item_id):
+    def flaky_ack(item_id, **kwargs):
         if acked:
             raise SpiderError(ErrorCode.unreachable, "dropped")
-        real_ack(item_id)
+        real_ack(item_id, **kwargs)
         acked.append(item_id)
 
     monkeypatch.setattr(api, "ack", flaky_ack)
@@ -333,6 +333,38 @@ def test_poll_asks_for_the_device_list_once(transport):
     with SpiderClient(config, transport=Counting()) as client:
         actions.poll(client)
     assert seen == ["POST /api/devices/heartbeat", "GET /api/devices", "GET /api/inbox"]
+
+
+def test_every_poll_request_has_a_finite_timeout(transport, other_api):
+    """A request that never answers would hold the window's single poll slot forever."""
+    seen = []
+
+    class Recording(httpx.BaseTransport):
+        def handle_request(self, request):
+            seen.append((f"{request.method} {request.url.path}", request.extensions["timeout"]))
+            return transport.handle_request(request)
+
+    config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
+    with SpiderClient(config, transport=Recording()) as client:
+        client.heartbeat()
+        other_api.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+        seen.clear()
+        actions.poll(client)
+    assert [call for call, _ in seen][-1].endswith("/ack")
+    finite = dict.fromkeys(("connect", "read", "write", "pool"), actions.POLL_TIMEOUT)
+    assert [timeout for _, timeout in seen] == [finite] * 4
+    assert actions.POLL_TIMEOUT == 15.0
+
+
+def test_a_stalled_poll_raises_unreachable():
+    def stall(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("stalled", request=request)
+
+    config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
+    with SpiderClient(config, transport=httpx.MockTransport(stall)) as client:
+        with pytest.raises(SpiderError) as caught:
+            actions.poll(client)
+    assert caught.value.code is ErrorCode.unreachable
 
 
 def old_server(request: httpx.Request) -> httpx.Response:
