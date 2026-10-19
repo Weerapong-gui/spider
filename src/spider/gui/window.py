@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QPoint, QSize, Qt, QThreadPool, QTimer, Slot
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -16,13 +27,18 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -30,12 +46,16 @@ from PySide6.QtWidgets import (
 from spider.cli.client import SpiderClient
 from spider.cli.main import SHORT_ID_LENGTH, humanize_age, humanize_size
 from spider.core.config import MIN_TOKEN_LENGTH, ClientConfig
-from spider.core.models import Item, ItemKind
+from spider.core.models import Device, Item, ItemHistory, ItemKind
 from spider.gui import actions
 from spider.gui.tasks import Task
 
 REFRESH_MS = 10_000
-COLUMNS = ("Name", "Kind", "Size", "From", "When", "ID")
+COLUMNS = ("", "Name", "Kind", "Size", "From", "When", "ID")
+PREVIEW_PX = 48
+ROW_PX = 52
+NO_SELECTION = "Select an item to see its history"
+GREEN, RED, GREY = "#3fb950", "#d6455d", "#8b8f9a"
 
 
 def make_icon() -> QIcon:
@@ -55,6 +75,38 @@ def make_icon() -> QIcon:
     painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "S")
     painter.end()
     return QIcon(pixmap)
+
+
+def dot_icon(color: str) -> QIcon:
+    """A status light for the device sidebar."""
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(3, 3, 10, 10)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def local_time(when: datetime) -> str:
+    local = when.astimezone()
+    if local.date() == datetime.now().astimezone().date():
+        return f"today {local:%H:%M}"
+    return f"{local:%Y-%m-%d %H:%M}"
+
+
+def history_lines(history: ItemHistory) -> list[str]:
+    """The upload, then each download, oldest first, as the panel shows them."""
+    item = history.item
+    upload = f"⬆ Uploaded from {item.source_device} · {local_time(item.created_at)}"
+    if item.to_device:
+        upload += f" → {item.to_device}"
+    lines = [f"History · {item.name}", upload]
+    for download in history.downloads:
+        lines.append(f"⬇ {download.device} → {download.destination} · {local_time(download.at)}")
+    return lines
 
 
 class SettingsDialog(QDialog):
@@ -118,13 +170,24 @@ class MainWindow(QMainWindow):
         self._open_settings = open_settings
         self._pool = QThreadPool.globalInstance()
         self._refresh_serial = 0
+        self._poll_serial = 0
+        self._history_serial = 0
         self._busy = 0
         self._quitting = False
         self._items: list[Item] = []
+        self._devices: list[Device] = []
+        self._server_ok = True
+        # True once a poll found the server predates devices: the sidebar and the
+        # history panel stay hidden and their routes are not asked again.
+        self._old_server = False
+        self._thumbs: dict[str, QIcon] = {}
+        # Every id ever asked for, so a missing thumbnail (None) is not fetched again.
+        self._thumbs_asked: set[str] = set()
+        self._type_icons: dict[str, QIcon] = {}
 
         self.setWindowTitle("spider")
         self.setWindowIcon(make_icon())
-        self.resize(860, 520)
+        self.resize(1080, 640)
         self.setAcceptDrops(True)
 
         self.send_clipboard_button = QPushButton("Send clipboard")
@@ -145,22 +208,64 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(ROW_PX)
+        self.table.setIconSize(QSize(PREVIEW_PX, PREVIEW_PX))
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 300)
+        self.table.setColumnWidth(0, PREVIEW_PX + 12)
+        self.table.setColumnWidth(1, 300)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_menu)
         self.table.cellDoubleClicked.connect(lambda row, _col: self._open_row(row))
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        # Scrolling or resizing brings new rows into view, which may need thumbnails.
+        self.table.verticalScrollBar().valueChanged.connect(self._fetch_thumbnails)
+        self.table.verticalScrollBar().rangeChanged.connect(self._fetch_thumbnails)
+
+        self.devices = QTreeWidget()
+        self.devices.setColumnCount(2)
+        self.devices.setHeaderHidden(True)
+        self.devices.setRootIsDecorated(False)
+        self.devices.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.devices.customContextMenuRequested.connect(self._show_device_menu)
+
+        self.history = QListWidget()
+        self.history.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.history.setWordWrap(True)
+        copy_lines = QAction("Copy", self.history)
+        copy_lines.setShortcut(QKeySequence.StandardKey.Copy)
+        copy_lines.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        copy_lines.triggered.connect(self._copy_history)
+        self.history.addAction(copy_lines)
+        self.history.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._show_history_hint()
 
         self.empty = QLabel("Nothing here yet. Send the clipboard, or drop files on this window.")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        listing = QWidget()
+        listing_layout = QVBoxLayout(listing)
+        listing_layout.setContentsMargins(0, 0, 0, 0)
+        listing_layout.addWidget(self.table, 1)
+        listing_layout.addWidget(self.empty, 1)
+
+        right = QSplitter(Qt.Orientation.Vertical)
+        right.addWidget(listing)
+        right.addWidget(self.history)
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 1)
+
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.addWidget(self.devices)
+        body.addWidget(right)
+        body.setStretchFactor(1, 1)
+        body.setSizes([220, 860])
+
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addLayout(top)
-        layout.addWidget(self.table, 1)
-        layout.addWidget(self.empty)
+        layout.addWidget(body, 1)
         self.setCentralWidget(central)
 
         file_menu = self.menuBar().addMenu("&File")
@@ -176,9 +281,10 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
 
-        self.send_clipboard_button.clicked.connect(self.send_clipboard)
+        # Lambdas: clicked passes `checked`, which must not land in `to_device`.
+        self.send_clipboard_button.clicked.connect(lambda: self.send_clipboard())
         self.paste_button.clicked.connect(self.paste_latest)
-        self.files_button.clicked.connect(self.choose_files)
+        self.files_button.clicked.connect(lambda: self.choose_files())
 
         self._search_timer = QTimer(self, singleShot=True, interval=250)
         self._search_timer.timeout.connect(self.refresh)
@@ -192,8 +298,13 @@ class MainWindow(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._build_tray()
 
+        # The count sits apart from the message area, so a refresh after a send
+        # cannot wipe the note that send just left there.
+        self.count = QLabel("")
+        self.statusBar().addPermanentWidget(self.count)
         self.statusBar().showMessage("Ready")
         self._set_empty(True)
+        self._render_devices()
 
     # --- plumbing -----------------------------------------------------
 
@@ -202,10 +313,12 @@ class MainWindow(QMainWindow):
         """Run a callback that a worker thread handed over, on the UI thread."""
         call()
 
-    def _start(self, work: Callable, on_done: Callable, on_failed: Callable) -> None:
+    def _start(
+        self, work: Callable, on_done: Callable, on_failed: Callable, priority: int = 0
+    ) -> None:
         task = Task(self._make_client, work, on_done, on_failed)
         task.signals.call.connect(self._invoke)
-        self._pool.start(task)
+        self._pool.start(task, priority)
 
     def run_task(self, work: Callable, on_done: Callable | None, label: str) -> None:
         self._busy += 1
@@ -243,32 +356,239 @@ class MainWindow(QMainWindow):
             lambda items: self._show_items(serial, items),
             lambda message: self.statusBar().showMessage(f"Error: {message}", 15_000),
         )
+        self._poll_serial += 1
+        poll_serial = self._poll_serial
+        # The listing already reports an unreachable server in the status bar, so
+        # a failed poll only turns the server light red.
+        self._start(
+            actions.poll,
+            lambda result: self._polled(poll_serial, result),
+            lambda _message: self._poll_failed(poll_serial),
+        )
+
+    def _polled(self, serial: int, result: actions.Poll) -> None:
+        if serial != self._poll_serial:
+            return
+        self._server_ok = True
+        self.show_devices(result.devices)
+        self._on_notices(result.notices)
+
+    def _poll_failed(self, serial: int) -> None:
+        if serial != self._poll_serial:
+            return
+        self._server_ok = False
+        self._render_devices()
+
+    def _on_notices(self, notices: list[actions.Notice]) -> None:
+        """Items sent to this device. Shown by the receive flow (Task 10); the
+        poll has already acked them, so they are not offered again."""
 
     def _show_items(self, serial: int, items: list[Item]) -> None:
         if serial != self._refresh_serial:
             return
         selected = self._selected_item()
         self._items = items
-        self.table.setRowCount(len(items))
-        for row, item in enumerate(items):
-            cells = (
-                item.name,
-                item.kind.value,
-                humanize_size(item.size),
-                item.source_device,
-                humanize_age(item.created_at),
-                item.id[:SHORT_ID_LENGTH],
-            )
-            for column, text in enumerate(cells):
-                cell = QTableWidgetItem(text)
-                if column == 0 and item.preview:
-                    cell.setToolTip(item.preview)
-                self.table.setItem(row, column, cell)
-            if selected is not None and item.id == selected.id:
-                self.table.selectRow(row)
+        # Rebuilding clears the selection for a moment; without blocking, the
+        # history panel would flash its hint and reload twice every refresh.
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(items))
+            for row, item in enumerate(items):
+                source = item.source_device
+                if item.to_device:
+                    source = f"{source} → {item.to_device}"
+                cells = (
+                    "",
+                    item.name,
+                    item.kind.value,
+                    humanize_size(item.size),
+                    source,
+                    humanize_age(item.created_at),
+                    item.id[:SHORT_ID_LENGTH],
+                )
+                for column, text in enumerate(cells):
+                    cell = QTableWidgetItem(text)
+                    if column == 1 and item.preview:
+                        cell.setToolTip(item.preview)
+                    self.table.setItem(row, column, cell)
+                self.table.item(row, 0).setIcon(self._preview_icon(item))
+                if selected is not None and item.id == selected.id:
+                    self.table.selectRow(row)
+        finally:
+            self.table.blockSignals(False)
+        self._selection_changed()
         self._set_empty(not items)
-        if not self._busy:
-            self.statusBar().showMessage(f"{len(items)} item(s)")
+        self._fetch_thumbnails()
+        self.count.setText(f"{len(items)} item(s)")
+
+    # --- previews -----------------------------------------------------
+
+    def _preview_icon(self, item: Item) -> QIcon:
+        """The thumbnail once it has arrived, the file-type logo until then (or for good)."""
+        if item.id in self._thumbs:
+            return self._thumbs[item.id]
+        stem = actions.icon_name(item.name, item.content_type, item.kind)
+        if stem not in self._type_icons:
+            self._type_icons[stem] = QIcon(str(actions.ICON_DIR / f"{stem}.svg"))
+        return self._type_icons[stem]
+
+    def _fetch_thumbnails(self, *_args) -> None:
+        """Ask for thumbnails of the image rows in view that were never asked for."""
+        if self._old_server or not self._items:
+            return
+        first = max(self.table.rowAt(0), 0)
+        last = self.table.rowAt(self.table.viewport().height() - 1)
+        if last < 0:
+            last = len(self._items) - 1
+        for item in self._items[first : last + 1]:
+            wanted = item.kind is ItemKind.file and item.content_type.startswith("image/")
+            if not wanted or item.id in self._thumbs_asked:
+                continue
+            self._fetch_thumbnail(item.id)
+
+    def _fetch_thumbnail(self, item_id: str) -> None:
+        # Its own method so each callback closes over its own id, not the loop's last.
+        self._thumbs_asked.add(item_id)
+        # Low priority: a page of thumbnails must not queue ahead of a send.
+        self._start(
+            lambda client: client.thumbnail(item_id),
+            lambda data: self._thumbnail_arrived(item_id, data),
+            lambda _message: self._thumbs_asked.discard(item_id),
+            priority=-1,
+        )
+
+    def _thumbnail_arrived(self, item_id: str, data: bytes | None) -> None:
+        if data is None:
+            return  # no thumbnail for this item; the logo stays, and we do not ask again
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            return
+        self._thumbs[item_id] = QIcon(pixmap)
+        for row, item in enumerate(self._items):
+            if item.id == item_id and self.table.item(row, 0) is not None:
+                self.table.item(row, 0).setIcon(self._thumbs[item_id])
+
+    # --- devices ------------------------------------------------------
+
+    def show_devices(self, devices: list[Device] | None) -> None:
+        """None means the server predates devices: hide what it cannot fill."""
+        self._old_server = devices is None
+        self.devices.setVisible(not self._old_server)
+        self.history.setVisible(not self._old_server)
+        self._devices = devices or []
+        self._render_devices()
+
+    def _identity(self) -> tuple[str, str]:
+        """The server host and this device's name, read from the current settings."""
+        client = self._make_client()
+        try:
+            config = client.config
+        finally:
+            client.close()
+        return urlparse(config.server).hostname or config.server, config.device
+
+    def _render_devices(self) -> None:
+        host, this_device = self._identity()
+        self.devices.clear()
+        server = QTreeWidgetItem(self.devices, ["Server"])
+        light = QTreeWidgetItem(server, [host, ""])
+        light.setIcon(0, dot_icon(GREEN if self._server_ok else RED))
+        light.setToolTip(0, "Reachable" if self._server_ok else "Cannot reach the server")
+        running = QTreeWidgetItem(self.devices, ["Running"])
+        offline = QTreeWidgetItem(self.devices, ["Offline"])
+        for device in self._devices:
+            label = device.name
+            if device.name == this_device:
+                label += " (this device)"
+            if device.online:
+                row = QTreeWidgetItem(running, [label, ""])
+                row.setIcon(0, dot_icon(GREEN))
+            else:
+                row = QTreeWidgetItem(offline, [label, humanize_age(device.last_seen)])
+                row.setIcon(0, dot_icon(GREY))
+            row.setData(0, Qt.ItemDataRole.UserRole, device.name)
+        for group in (server, running, offline):
+            group.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            group.setExpanded(True)
+        self.devices.resizeColumnToContents(1)
+
+    def _device_at(self, position: QPoint) -> str | None:
+        """The other device under a point in the sidebar's viewport, if any."""
+        row = self.devices.itemAt(position)
+        name = row.data(0, Qt.ItemDataRole.UserRole) if row is not None else None
+        if name is None or name == self._identity()[1]:
+            return None  # sending to yourself is refused; a drop there is a plain send
+        return name
+
+    def _is_online(self, name: str) -> bool:
+        return any(device.name == name and device.online for device in self._devices)
+
+    def _show_device_menu(self, position) -> None:
+        name = self._device_at(position)
+        if name is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Send clipboard to this device", lambda: self.send_clipboard(name))
+        menu.addAction("Send files to this device…", lambda: self.choose_files(name))
+        if not self._is_online(name):
+            menu.addSeparator()
+            menu.addAction("Remove from list", lambda: self.remove_device(name))
+        menu.exec(self.devices.viewport().mapToGlobal(position))
+
+    def remove_device(self, name: str) -> None:
+        self.run_task(
+            lambda client: client.remove_device(name),
+            lambda _result: self._sent(f"Removed {name} from the list"),
+            f"Removing {name}…",
+        )
+
+    # --- history ------------------------------------------------------
+
+    def _selection_changed(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            self._history_serial += 1  # drop any answer still on its way
+            self._show_history_hint()
+        else:
+            self._load_history(item.id)
+
+    def _show_history_hint(self) -> None:
+        self.history.clear()
+        hint = QListWidgetItem(NO_SELECTION)
+        hint.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.history.addItem(hint)
+
+    def _load_history(self, item_id: str) -> None:
+        # Moving quickly between rows must not leave an older row's history showing.
+        self._history_serial += 1
+        serial = self._history_serial
+        if self._old_server:
+            return
+        self._start(
+            lambda client: actions.load_history(client, item_id),
+            lambda history: self._show_history(serial, history),
+            lambda message: self._history_failed(serial, message),
+        )
+
+    def _show_history(self, serial: int, history: ItemHistory | None) -> None:
+        if serial != self._history_serial:
+            return
+        if history is None:
+            self.history.setVisible(False)
+            return
+        self.history.clear()
+        self.history.addItems(history_lines(history))
+
+    def _history_failed(self, serial: int, message: str) -> None:
+        if serial != self._history_serial:
+            return
+        self.history.clear()
+        self.history.addItem(f"Could not load the history: {message}")
+
+    def _copy_history(self) -> None:
+        lines = [row.text() for row in self.history.selectedItems()]
+        if lines:
+            QGuiApplication.clipboard().setText("\n".join(lines))
 
     def _selected_item(self) -> Item | None:
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
@@ -278,11 +598,14 @@ class MainWindow(QMainWindow):
 
     # --- actions ------------------------------------------------------
 
-    def send_clipboard(self) -> None:
+    def send_clipboard(self, to_device: str | None = None) -> None:
         text = QGuiApplication.clipboard().text()
         self.run_task(
-            lambda client: actions.send_text(client, text),
-            lambda item: self._sent(f"Sent {humanize_size(item.size)} as “{item.name}”"),
+            lambda client: actions.send_text(client, text, to_device),
+            lambda item: self._sent(
+                f"Sent {humanize_size(item.size)} as “{item.name}”{self._to(to_device)}",
+                to_device,
+            ),
             "Sending clipboard…",
         )
 
@@ -303,21 +626,29 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 8000)
         self.notify("spider", message)
 
-    def choose_files(self) -> None:
-        names, _ = QFileDialog.getOpenFileNames(self, "Send files")
+    def choose_files(self, to_device: str | None = None) -> None:
+        title = f"Send files to {to_device}" if to_device else "Send files"
+        names, _ = QFileDialog.getOpenFileNames(self, title)
         if names:
-            self.send_paths([Path(name) for name in names])
+            self.send_paths([Path(name) for name in names], to_device)
 
-    def send_paths(self, paths: list[Path]) -> None:
+    def send_paths(self, paths: list[Path], to_device: str | None = None) -> None:
         self.run_task(
-            lambda client: actions.send_files(client, paths),
-            lambda items: self._sent(f"Sent {len(items)} file(s)"),
+            lambda client: actions.send_files(client, paths, to_device),
+            lambda items: self._sent(f"Sent {len(items)} file(s){self._to(to_device)}", to_device),
             f"Sending {len(paths)} file(s)…",
         )
 
-    def _sent(self, message: str) -> None:
-        self.statusBar().showMessage(message, 8000)
+    @staticmethod
+    def _to(to_device: str | None) -> str:
+        return f" to {to_device}" if to_device else ""
+
+    def _sent(self, message: str, to_device: str | None = None) -> None:
         self.notify("spider", message)
+        if to_device and not self._is_online(to_device):
+            # Still sent: the item waits in that device's inbox for its next desktop app.
+            message = f"{to_device} has no desktop app running; it will see this when it opens one."
+        self.statusBar().showMessage(message, 8000)
         self.refresh()
 
     def _open_row(self, row: int) -> None:
@@ -384,11 +715,20 @@ class MainWindow(QMainWindow):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
+    def _drop_target(self, event) -> str | None:
+        """The device row under a drag, in window coordinates; None for anywhere else."""
+        if self.devices.isHidden():
+            return None
+        point = self.devices.viewport().mapFrom(self, event.position().toPoint())
+        if not self.devices.viewport().rect().contains(point):
+            return None
+        return self._device_at(point)
+
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
         paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
         if paths:
             event.acceptProposedAction()
-            self.send_paths(paths)
+            self.send_paths(paths, self._drop_target(event))
 
     # --- settings, tray, closing -------------------------------------
 
@@ -399,7 +739,7 @@ class MainWindow(QMainWindow):
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(make_icon(), self)
         menu = QMenu()
-        menu.addAction("Send clipboard", self.send_clipboard)
+        menu.addAction("Send clipboard", lambda: self.send_clipboard())
         menu.addAction("Paste latest", self.paste_latest)
         menu.addSeparator()
         menu.addAction("Show spider", self.show_window)

@@ -298,3 +298,32 @@ def test_poll_against_an_old_server_returns_no_devices():
     old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))
     client = SpiderClient(config, transport=old)
     assert actions.poll(client) == actions.Poll(None, [])
+
+
+def test_send_text_and_files_to_a_device_land_in_its_inbox(api, other_api, tmp_path):
+    other_api.heartbeat()
+    path = tmp_path / "a.txt"
+    path.write_bytes(b"a")
+    actions.send_text(api, "for you", to_device="park-macbook")
+    actions.send_files(api, [path], to_device="park-macbook")
+    assert sorted(item.name for item in other_api.inbox()) == ["a.txt", "for you"]
+
+
+def test_load_history_lists_the_downloads(api):
+    item = actions.send_text(api, "history please")
+    actions.fetch_text(api, item.id)
+    history = actions.load_history(api, item.id)
+    assert [d.destination for d in history.downloads] == ["clipboard"]
+
+
+def test_load_history_is_none_against_an_old_server():
+    config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
+    old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))
+    client = SpiderClient(config, transport=old)
+    assert actions.load_history(client, "abc") is None
+
+
+def test_load_history_of_a_deleted_item_still_raises(api):
+    with pytest.raises(SpiderError) as caught:
+        actions.load_history(api, "0" * 26)
+    assert caught.value.code is ErrorCode.not_found

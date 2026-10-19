@@ -14,7 +14,7 @@ from pathlib import Path
 from spider.cli.client import SpiderClient
 from spider.cli.main import humanize_size, safe_filename
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import Device, Item, ItemKind
+from spider.core.models import Device, Item, ItemHistory, ItemKind
 
 TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
 LIST_LIMIT = 200
@@ -56,7 +56,7 @@ def clipboard_label(text: str) -> str:
     return " ".join(first.split())[:40] or "clipboard"
 
 
-def send_text(client: SpiderClient, text: str) -> Item:
+def send_text(client: SpiderClient, text: str, to_device: str | None = None) -> Item:
     if not text.strip():
         raise SpiderError(ErrorCode.bad_request, "The clipboard is empty. Copy something first.")
     return client.push_bytes(
@@ -64,17 +64,18 @@ def send_text(client: SpiderClient, text: str) -> Item:
         kind=ItemKind.text,
         name=clipboard_label(text),
         content_type=TEXT_CONTENT_TYPE,
+        to_device=to_device,
     )
 
 
-def send_files(client: SpiderClient, paths: list[Path]) -> list[Item]:
+def send_files(client: SpiderClient, paths: list[Path], to_device: str | None = None) -> list[Item]:
     sent: list[Item] = []
     for path in paths:
         if not path.is_file():
             raise SpiderError(
                 ErrorCode.bad_request, f"{path} is not a file (folders are not sent)."
             )
-        sent.append(client.push_file(path))
+        sent.append(client.push_file(path, to_device=to_device))
     return sent
 
 
@@ -225,6 +226,20 @@ def poll(client: SpiderClient) -> Poll:
     for item in inbox:
         client.ack(item.id)
     return Poll(devices, group_notices(inbox))
+
+
+def load_history(client: SpiderClient, ref: str) -> ItemHistory | None:
+    """None when the server predates history.
+
+    An old server's plain 404 maps to `unreachable`, which a real outage also is, so
+    only on failure do we spend a second request asking whether the routes exist.
+    """
+    try:
+        return client.history(ref)
+    except SpiderError:
+        if not client.supports_devices():
+            return None
+        raise
 
 
 def suggested_filename(item: Item) -> str:
