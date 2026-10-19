@@ -588,7 +588,7 @@ def test_touch_upserts_client_without_clearing_heartbeat(store):
 def test_remove_device_keeps_history(store):
     item = save(store, to_device=None)
     store.touch_device("pc", ClientKind.cli)
-    store.record_download(item.id, "pc", ClientKind.cli, "/tmp/a")
+    store.record_download(item.id, "pc", ClientKind.cli, "/dl/a")
     store.remove_device("pc")
     assert store.history(item.id).downloads[0].device == "pc"
     assert store.device_names() == []
