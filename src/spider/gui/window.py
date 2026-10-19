@@ -58,9 +58,6 @@ ROW_PX = 52
 NO_SELECTION = "Select an item to see its history"
 GREEN, RED, GREY = "#3fb950", "#d6455d", "#8b8f9a"
 TRAY_RECEIVE_LIMIT = 5
-# The endings `actions.group_notices` gives each kind of notice.
-TEXT_ENDING = " — click to copy to the clipboard"
-FILE_ENDING = " — click to save to Downloads"
 
 
 def make_icon() -> QIcon:
@@ -102,21 +99,6 @@ def local_time(when: datetime) -> str:
     return f"{local:%Y-%m-%d %H:%M}"
 
 
-def notice_name(notice: actions.Notice) -> str | None:
-    """The single item a notice names, read back from its copy; None for a group."""
-    message = notice.message
-    if message.endswith(TEXT_ENDING):
-        return message.removesuffix(TEXT_ENDING)
-    if message.endswith(FILE_ENDING):
-        return message.removesuffix(FILE_ENDING).rpartition(" (")[0] or None
-    return None
-
-
-def is_text_notice(notice: actions.Notice) -> bool:
-    # Texts are never grouped, so a text notice is exactly one text item.
-    return notice.message.endswith(TEXT_ENDING)
-
-
 class NoticeRow(QWidget):
     """One pending notice in the banner: what arrived, take it, or put it away."""
 
@@ -125,7 +107,7 @@ class NoticeRow(QWidget):
         self.notice = notice
         self.label = QLabel(notice.message)
         self.label.setToolTip(notice.title)
-        self.action = QPushButton("Copy" if is_text_notice(notice) else "Save to Downloads")
+        self.action = QPushButton("Copy" if notice.is_text else "Save to Downloads")
         self.dismiss = QPushButton("Dismiss")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 2, 8, 2)
@@ -838,12 +820,12 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(bool(self._notice_rows))
         self._render_receive_actions()
 
-    def _notice_label(self, notice: actions.Notice) -> str:
-        """The first item's name, from the listing or the notice's own copy."""
-        names = {item.id: item.name for item in self._items}
-        if notice.item_ids and notice.item_ids[0] in names:
-            return names[notice.item_ids[0]]
-        return notice_name(notice) or notice.message.partition(" — ")[0]
+    @staticmethod
+    def _notice_label(notice: actions.Notice) -> str:
+        """The item's name, or for a group what the notice calls it ("2 files from …")."""
+        if len(notice.names) == 1:
+            return notice.names[0]
+        return notice.message.partition(" — ")[0]
 
     def _render_receive_actions(self) -> None:
         """The newest few pending notices as "Receive …" entries atop the tray menu."""
@@ -878,7 +860,7 @@ class MainWindow(QMainWindow):
             self._receiving.add(key)
             self._notice_rows[key].action.setEnabled(False)
         item_ids = list(notice.item_ids)
-        fallback = notice_name(notice) or "That item"
+        known = dict(zip(notice.item_ids, notice.names, strict=True))
 
         def work(client: SpiderClient) -> list[actions.Received | str]:
             # Read at click time: the tests point it elsewhere.
@@ -906,14 +888,14 @@ class MainWindow(QMainWindow):
             self._receiving.discard(key)
             if key is not None:
                 self._drop_notice(key)
-            self._received(outcomes, fallback)
+            self._received(outcomes, known)
 
         self._busy += 1
         self.statusBar().showMessage("Receiving…")
         self._start(work, done, failed)
 
-    def _received(self, outcomes: list[actions.Received | str], fallback: str) -> None:
-        names = {item.id: item.name for item in self._items}
+    def _received(self, outcomes: list[actions.Received | str], known: dict[str, str]) -> None:
+        names = {item.id: item.name for item in self._items} | known
         saved = [o.path for o in outcomes if isinstance(o, actions.Received) and o.path]
         messages: list[str] = []
         if len(saved) == 1:
@@ -922,7 +904,7 @@ class MainWindow(QMainWindow):
             messages.append(f"Saved {len(saved)} files to {saved[0].parent}")
         for outcome in outcomes:
             if isinstance(outcome, str):
-                messages.append(f"“{names.get(outcome, fallback)}” is no longer on the server")
+                messages.append(f"“{names.get(outcome, 'That item')}” is no longer on the server")
             elif outcome.text is not None:
                 QGuiApplication.clipboard().setText(outcome.text)
                 messages.append(f"Copied “{outcome.item.name}” to the clipboard")

@@ -178,6 +178,9 @@ class Notice:
     title: str
     message: str
     item_ids: list[str]
+    # Said outright so the window never has to read them back out of the message.
+    is_text: bool
+    names: list[str]
 
 
 def group_notices(items: list[Item]) -> list[Notice]:
@@ -197,7 +200,7 @@ def group_notices(items: list[Item]) -> list[Notice]:
         if isinstance(slot, Item):
             title = f"spider · from {slot.source_device}"
             message = f"{slot.name} — click to copy to the clipboard"
-            notices.append(Notice(title, message, [slot.id]))
+            notices.append(Notice(title, message, [slot.id], True, [slot.name]))
             continue
         group = files[slot]
         if len(group) == 1:
@@ -205,7 +208,8 @@ def group_notices(items: list[Item]) -> list[Notice]:
             message = f"{only.name} ({humanize_size(only.size)}) — click to save to Downloads"
         else:
             message = f"{len(group)} files from {slot} — click to receive all"
-        notices.append(Notice(f"spider · from {slot}", message, [i.id for i in group]))
+        ids, names = [i.id for i in group], [i.name for i in group]
+        notices.append(Notice(f"spider · from {slot}", message, ids, False, names))
     return notices
 
 

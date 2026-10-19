@@ -269,6 +269,11 @@ def test_group_notices_groups_files_but_not_texts():
     assert files.message == "3 files from park-macbook — click to receive all"
     assert files.title == "spider · from park-macbook"
     assert sum(1 for n in notices if len(n.item_ids) == 1) == 2
+    assert [(n.is_text, n.names) for n in notices] == [
+        (False, ["a.pdf", "b.pdf", "c.pdf"]),
+        (True, ["note one"]),
+        (True, ["note two"]),
+    ]
 
 
 def test_group_notices_single_file_and_sender_order():
