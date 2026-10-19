@@ -588,6 +588,14 @@ def test_browser_attachment_is_recorded_with_ip(client):
     assert download["destination"] and "clipboard" not in download["destination"]
 
 
+def test_browser_download_of_a_missing_blob_is_not_recorded(client, store):
+    item = upload(client, b"x").json()
+    store.blob_path(item["id"]).unlink()
+    client.cookies.set(SESSION_COOKIE, TOKEN)
+    assert client.get(f"/api/items/{item['id']}/content").status_code == 404
+    assert client.get(f"/api/items/{item['id']}/history").json()["downloads"] == []
+
+
 def test_browser_inline_is_not_recorded(client):
     item = upload(client, b"x").json()
     client.cookies.set(SESSION_COOKIE, TOKEN)

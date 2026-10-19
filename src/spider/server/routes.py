@@ -246,12 +246,17 @@ def build_router(storage: Storage, token: str, max_item_mb: int = 0) -> list[API
         purpose: Annotated[str | None, Query()] = None,
     ) -> StreamingResponse:
         item = storage.resolve(ref)
+        # Opened first, so a missing blob never leaves a download in the history.
+        handle = storage.open_blob(item.id)
         if request.state.caller.client is ClientKind.browser and disposition != "inline":
             # Recorded when the send starts: only the browser knows if it finished.
             ip = request.client.host if request.client else "unknown"
             destination = f"clipboard ({ip})" if purpose == "clipboard" else ip
-            storage.record_download(item.id, BROWSER_DEVICE, ClientKind.browser, destination)
-        handle = storage.open_blob(item.id)
+            try:
+                storage.record_download(item.id, BROWSER_DEVICE, ClientKind.browser, destination)
+            except BaseException:
+                handle.close()
+                raise
         inline = disposition == "inline" and is_inline_safe(item.content_type)
 
         def stream() -> Iterator[bytes]:
