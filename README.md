@@ -78,6 +78,8 @@ spider paste [ref]           server -> clipboard
 spider push FILE...          send files
 spider push -                send stdin
 spider push -t "text"        send text
+spider push FILE --to NAME   send to one device's inbox (also: copy --to NAME)
+spider devices               list devices, online or offline
 spider ls [-q SEARCH]        list, newest first
 spider pull [ref] [-o PATH]  download
 spider cat [ref]             write to stdout

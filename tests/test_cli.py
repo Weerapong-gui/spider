@@ -619,3 +619,85 @@ def test_cat_of_a_missing_blob_prints_an_error_not_a_traceback(cli, store):
     output = " ".join(combined(result).split())  # rich wraps long lines
     assert "Traceback" not in output
     assert "spider verify" in output
+
+
+@pytest.fixture
+def other(api, config):
+    """A second device on the same server, already known to it."""
+    client = SpiderClient(
+        ClientConfig(server=config.server, token=TOKEN, device="other"),
+        transport=api._http._transport,
+    )
+    client.heartbeat()
+    yield client
+    client.close()
+
+
+def test_push_to_sends_to_that_device(cli, other, tmp_path):
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"abc")
+    result = cli.invoke(cli_main.app, ["push", str(path), "--to", "other"])
+    assert result.exit_code == 0
+    assert [i.name for i in other.inbox()] == ["f.bin"]
+
+
+def test_copy_to_unknown_device_fails_with_the_known_names(cli, other, monkeypatch):
+    monkeypatch.setattr(pyperclip, "paste", lambda: "hello")
+    result = cli.invoke(cli_main.app, ["copy", "--to", "nobody"])
+    assert result.exit_code != 0
+    assert "other" in combined(result)
+
+
+def test_devices_pipe_output_is_tsv(cli, other):
+    result = cli.invoke(cli_main.app, ["devices"])
+    assert result.exit_code == 0
+    rows = [line.split("\t") for line in result.output.strip().splitlines()]
+    by_name = {row[0]: row for row in rows}
+    assert by_name["other"][1:3] == ["gui", "online"]  # heartbeats mark a GUI
+    assert by_name["test-device"][1:3] == ["cli", "offline"]  # only a heartbeat means online
+    assert len(by_name["other"]) == 4
+    assert "\x1b[" not in result.output
+
+
+def test_ls_pipe_has_a_to_device_column(cli, other, tmp_path):
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"abc")
+    cli.invoke(cli_main.app, ["push", str(path), "--to", "other"])
+    cli.invoke(cli_main.app, ["push", "-t", "plain"])
+    lines = cli.invoke(cli_main.app, ["ls"]).output.strip().splitlines()
+    columns = [line.split("\t") for line in lines]
+    assert all(len(c) == 7 for c in columns)
+    assert sorted(c[6] for c in columns) == ["", "other"]
+
+
+def test_pull_reports_the_absolute_path(cli, api, tmp_path):
+    cli.invoke(cli_main.app, ["push", "-t", "body", "--name", "f.bin"])
+    target = tmp_path / "f.bin"
+    result = cli.invoke(cli_main.app, ["pull", "latest", "-o", str(target)])
+    assert result.exit_code == 0
+    item = api.list_items().items[0]
+    assert [d.destination for d in api.history(item.id).downloads] == [str(target.resolve())]
+
+
+def test_cat_reports_stdout_and_keeps_stdout_clean(cli, api):
+    cli.invoke(cli_main.app, ["push", "-t", "payload", "--name", "n"])
+    result = cli.invoke(cli_main.app, ["cat", "latest"])
+    assert result.exit_code == 0
+    assert result.output == "payload"
+    item = api.list_items().items[0]
+    assert [d.destination for d in api.history(item.id).downloads] == ["stdout"]
+
+
+def test_pull_warns_when_the_report_fails(cli, tmp_path, monkeypatch):
+    cli.invoke(cli_main.app, ["push", "-t", "body", "--name", "f.bin"])
+
+    def boom(self, item_id, destination):
+        raise SpiderError(ErrorCode.bad_request, "history is down")
+
+    monkeypatch.setattr(SpiderClient, "report_download", boom)
+    target = tmp_path / "f.bin"
+    result = cli.invoke(cli_main.app, ["pull", "latest", "-o", str(target)])
+    assert result.exit_code == 0
+    assert target.read_bytes() == b"body"
+    assert "warning" in combined(result)
+    assert "history is down" in combined(result)

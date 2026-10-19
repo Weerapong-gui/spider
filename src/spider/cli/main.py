@@ -28,7 +28,7 @@ from spider.core.config import (
     save_client_config,
 )
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import Item, ItemKind
+from spider.core.models import Device, Item, ItemKind
 
 app = typer.Typer(
     add_completion=False,
@@ -98,6 +98,48 @@ def fail(exc: SpiderError) -> None:
     raise typer.Exit(exc.exit_code)
 
 
+def report_quietly(client: SpiderClient, item_id: str, destination: str) -> None:
+    """Record a finished download, without letting a failure undo it.
+
+    The bytes are already where the user wanted them; losing a history row must
+    not turn that success into an error. Warnings go to stderr so `spider cat`
+    keeps stdout byte-exact.
+    """
+    try:
+        client.report_download(item_id, destination)
+    except SpiderError as exc:
+        err.print(f"[yellow]warning[/yellow] could not record this download: {exc.message}")
+
+
+def render_devices(devices: list[Device], this_device: str) -> None:
+    """A table on a terminal, tab-separated values anywhere else."""
+    if not sys.stdout.isatty():
+        for device in devices:
+            print(
+                "\t".join(
+                    [
+                        device.name,
+                        device.client.value,
+                        "online" if device.online else "offline",
+                        device.last_seen.isoformat(),
+                    ]
+                )
+            )
+        return
+
+    table = Table(box=None, pad_edge=False)
+    for column in ("Name", "Client", "Status", "Last seen"):
+        table.add_column(column)
+    for device in devices:
+        table.add_row(
+            f"{device.name} (this device)" if device.name == this_device else device.name,
+            device.client.value,
+            "online" if device.online else "offline",
+            humanize_age(device.last_seen),
+        )
+    out.print(table)
+
+
 def render_items(items: list[Item]) -> None:
     """A table on a terminal, tab-separated values anywhere else.
 
@@ -115,6 +157,7 @@ def render_items(items: list[Item]) -> None:
                         str(item.size),
                         item.source_device,
                         item.created_at.isoformat(),
+                        item.to_device or "",
                     ]
                 )
             )
@@ -129,7 +172,9 @@ def render_items(items: list[Item]) -> None:
             item.kind.value,
             item.name,
             humanize_size(item.size),
-            item.source_device,
+            f"{item.source_device} \u2192 {item.to_device}"
+            if item.to_device
+            else item.source_device,
             humanize_age(item.created_at),
         )
     out.print(table)
@@ -169,6 +214,7 @@ def push(
     paths: list[str] = typer.Argument(None, help="Files to send. Use - to read stdin."),  # noqa: B008
     text: str = typer.Option(None, "-t", "--text", help="Send this text instead of a file."),
     name: str = typer.Option(None, "--name", help="Override the stored name."),
+    to: str = typer.Option(None, "--to", help="Send to this device's inbox."),
 ) -> None:
     """Send files or text to the server."""
     client = build_client()
@@ -179,6 +225,7 @@ def push(
                 kind=ItemKind.text,
                 name=name or "text",
                 content_type="text/plain; charset=utf-8",
+                to_device=to,
             )
             out.print(f"{short_id(item)}  {item.name}  {humanize_size(item.size)}")
             return
@@ -194,12 +241,13 @@ def push(
                     kind=ItemKind.text,
                     name=name or "stdin",
                     content_type="text/plain; charset=utf-8",
+                    to_device=to,
                 )
             else:
                 path = Path(raw)
                 if not path.is_file():
                     fail(SpiderError(ErrorCode.not_found, f"No such file: {raw}"))
-                item = client.push_file(path, name=name)
+                item = client.push_file(path, name=name, to_device=to)
             out.print(f"{short_id(item)}  {item.name}  {humanize_size(item.size)}")
     except SpiderError as exc:
         fail(exc)
@@ -249,6 +297,7 @@ def pull(
             staging.replace(target)
         finally:
             staging.unlink(missing_ok=True)
+        report_quietly(client, item.id, str(target.resolve()))
     except SpiderError as exc:
         fail(exc)
     out.print(f"{target}  {humanize_size(item.size)}  sha256 verified")
@@ -257,11 +306,25 @@ def pull(
 @app.command("cat")
 def cat_command(ref: str = typer.Argument("latest")) -> None:
     """Write an item's bytes to stdout. Works on machines with no clipboard."""
+    client = build_client()
     try:
-        build_client().download(ref, sys.stdout.buffer)
+        item = client.resolve(ref)
+        client.download(item.id, sys.stdout.buffer)
         sys.stdout.buffer.flush()
+        report_quietly(client, item.id, "stdout")
     except SpiderError as exc:
         fail(exc)
+
+
+@app.command("devices")
+def devices_command() -> None:
+    """List the devices that have connected to the server."""
+    client = build_client()
+    try:
+        devices = client.devices()
+    except SpiderError as exc:
+        fail(exc)
+    render_devices(devices, client.config.device)
 
 
 @app.command("rm")
@@ -304,6 +367,7 @@ def _clipboard_label(text: str) -> str:
 @app.command("copy")
 def copy_command(
     name: str = typer.Option(None, "--name", help="Override the stored name."),
+    to: str = typer.Option(None, "--to", help="Send to this device's inbox."),
 ) -> None:
     """Send this machine's clipboard to the server."""
     try:
@@ -313,6 +377,7 @@ def copy_command(
             kind=ItemKind.text,
             name=name or _clipboard_label(text),
             content_type="text/plain; charset=utf-8",
+            to_device=to,
         )
     except SpiderError as exc:
         fail(exc)
@@ -347,6 +412,7 @@ def paste_command(
                 )
             )
         write_clipboard(text)
+        report_quietly(client, item.id, "clipboard")
     except SpiderError as exc:
         fail(exc)
     out.print(f"pasted {humanize_size(item.size)} from {short_id(item)}  {item.name}")
