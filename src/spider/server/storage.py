@@ -19,12 +19,22 @@ from pathlib import Path
 from typing import BinaryIO
 
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import Item, ItemKind, ItemPage, new_ulid
+from spider.core.models import (
+    ClientKind,
+    Device,
+    Download,
+    Item,
+    ItemHistory,
+    ItemKind,
+    ItemPage,
+    new_ulid,
+)
 
 PREVIEW_CHARS = 200
 _PREVIEW_BYTES = PREVIEW_CHARS * 4  # worst case for UTF-8
 _ID_ALPHABET = frozenset("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
 _MAX_LIMIT = 200
+ONLINE_WINDOW = timedelta(seconds=30)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -355,6 +365,123 @@ class Storage:
         finally:
             connection.close()
         self.blob_path(item.id).unlink(missing_ok=True)
+
+    def touch_device(self, name: str, client: ClientKind, *, now: datetime | None = None) -> None:
+        """Record that `name` was just seen, without touching its heartbeat."""
+        stamp = (now or datetime.now(UTC)).isoformat()
+        self._write(
+            "INSERT INTO devices (name, client, last_seen) VALUES (?,?,?)"
+            " ON CONFLICT(name) DO UPDATE SET client = excluded.client,"
+            " last_seen = excluded.last_seen",
+            (name, client.value, stamp),
+        )
+
+    def heartbeat(self, name: str, *, now: datetime | None = None) -> None:
+        """Only the GUI beats, so only a GUI can ever be online."""
+        now = now or datetime.now(UTC)
+        self.touch_device(name, ClientKind.gui, now=now)
+        self._write("UPDATE devices SET heartbeat_at = ? WHERE name = ?", (now.isoformat(), name))
+
+    def clear_heartbeat(self, name: str) -> None:
+        self._write("UPDATE devices SET heartbeat_at = NULL WHERE name = ?", (name,))
+
+    def list_devices(self, *, now: datetime | None = None) -> list[Device]:
+        cutoff = ((now or datetime.now(UTC)) - ONLINE_WINDOW).isoformat()
+        connection = self.connect()
+        try:
+            rows = connection.execute("SELECT * FROM devices ORDER BY last_seen DESC").fetchall()
+        finally:
+            connection.close()
+        return [
+            Device(
+                name=row["name"],
+                client=ClientKind(row["client"]),
+                last_seen=datetime.fromisoformat(row["last_seen"]),
+                online=row["heartbeat_at"] is not None and row["heartbeat_at"] >= cutoff,
+            )
+            for row in rows
+        ]
+
+    def device_names(self) -> list[str]:
+        connection = self.connect()
+        try:
+            return [row["name"] for row in connection.execute("SELECT name FROM devices")]
+        finally:
+            connection.close()
+
+    def remove_device(self, name: str) -> None:
+        """Forget a device. Its past downloads stay: history is a record, not a roster."""
+        if self._write("DELETE FROM devices WHERE name = ?", (name,)) == 0:
+            raise SpiderError(ErrorCode.not_found, f"No device named {name!r}.")
+
+    def inbox(self, device: str) -> list[Item]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM items WHERE to_device = ? AND notified_at IS NULL ORDER BY id",
+                (device,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [self._row_to_item(row) for row in rows]
+
+    def ack(self, item_id: str, device: str, *, now: datetime | None = None) -> None:
+        """Mark an item notified. Only its addressee may; anyone else sees not_found."""
+        stamp = (now or datetime.now(UTC)).isoformat()
+        changed = self._write(
+            "UPDATE items SET notified_at = COALESCE(notified_at, ?)"
+            " WHERE id = ? AND to_device = ?",
+            (stamp, item_id, device),
+        )
+        if changed == 0:
+            raise SpiderError(ErrorCode.not_found, f"No item {item_id} addressed to {device!r}.")
+
+    def record_download(
+        self,
+        item_id: str,
+        device: str,
+        client: ClientKind,
+        destination: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        stamp = (now or datetime.now(UTC)).isoformat()
+        self._write(
+            "INSERT INTO downloads (item_id, device, client, destination, at) VALUES (?,?,?,?,?)",
+            (item_id, device, client.value, destination, stamp),
+        )
+
+    def history(self, item_id: str) -> ItemHistory:
+        item = self.get(item_id)
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM downloads WHERE item_id = ? ORDER BY at, id", (item.id,)
+            ).fetchall()
+        finally:
+            connection.close()
+        return ItemHistory(
+            item=item,
+            downloads=[
+                Download(
+                    device=row["device"],
+                    client=ClientKind(row["client"]),
+                    destination=row["destination"],
+                    at=datetime.fromisoformat(row["at"]),
+                )
+                for row in rows
+            ],
+        )
+
+    def _write(self, sql: str, params: tuple) -> int:
+        """Run one write statement and return how many rows it changed."""
+        connection = self.connect()
+        try:
+            changed = connection.execute(sql, params).rowcount
+            connection.commit()
+        finally:
+            connection.close()
+        return changed
 
     def gc(self, max_age_seconds: int = 3600) -> int:
         """Remove abandoned partial uploads and blobs no row points at.

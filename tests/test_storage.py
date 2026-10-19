@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import ItemKind
+from spider.core.models import ClientKind, ItemKind
 from spider.server.storage import Storage
 
 
@@ -529,3 +529,117 @@ def test_save_stores_to_device(store):
         to_device="pc",
     )
     assert store.get(item.id).to_device == "pc"
+
+
+def save(store, to_device=None):
+    return store.save(
+        stream=[b"x"],
+        kind=ItemKind.file,
+        name="a.bin",
+        content_type="application/octet-stream",
+        source_device="src",
+        to_device=to_device,
+    )
+
+
+def count_rows(store, table):
+    connection = store.connect()
+    try:
+        return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+    finally:
+        connection.close()
+
+
+def test_device_is_online_within_30_seconds_of_a_heartbeat(store):
+    t0 = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+    store.heartbeat("pc", now=t0)
+    assert store.list_devices(now=t0 + timedelta(seconds=30))[0].online is True
+    assert store.list_devices(now=t0 + timedelta(seconds=31))[0].online is False
+
+
+def test_cli_touch_is_never_online(store):
+    store.touch_device("linux", ClientKind.cli)
+    [device] = store.list_devices()
+    assert device.client is ClientKind.cli and device.online is False
+
+
+def test_clear_heartbeat_goes_offline_immediately(store):
+    store.heartbeat("pc")
+    store.clear_heartbeat("pc")
+    assert store.list_devices()[0].online is False
+
+
+def test_devices_are_listed_most_recently_seen_first(store):
+    t0 = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+    store.touch_device("old", ClientKind.cli, now=t0)
+    store.touch_device("new", ClientKind.gui, now=t0 + timedelta(seconds=5))
+    assert [d.name for d in store.list_devices()] == ["new", "old"]
+    assert sorted(store.device_names()) == ["new", "old"]
+
+
+def test_touch_upserts_client_without_clearing_heartbeat(store):
+    t0 = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+    store.heartbeat("pc", now=t0)
+    store.touch_device("pc", ClientKind.cli, now=t0 + timedelta(seconds=1))
+    [device] = store.list_devices(now=t0 + timedelta(seconds=2))
+    assert device.client is ClientKind.cli and device.online is True
+
+
+def test_remove_device_keeps_history(store):
+    item = save(store, to_device=None)
+    store.touch_device("pc", ClientKind.cli)
+    store.record_download(item.id, "pc", ClientKind.cli, "/tmp/a")
+    store.remove_device("pc")
+    assert store.history(item.id).downloads[0].device == "pc"
+    assert store.device_names() == []
+
+
+def test_remove_unknown_device_is_not_found(store):
+    with pytest.raises(SpiderError) as exc:
+        store.remove_device("ghost")
+    assert exc.value.code is ErrorCode.not_found
+
+
+def test_inbox_returns_only_unacknowledged_items_for_that_device(store):
+    a = save(store, to_device="pc")
+    save(store, to_device="mac")
+    save(store)
+    assert [i.id for i in store.inbox("pc")] == [a.id]
+    store.ack(a.id, "pc")
+    assert store.inbox("pc") == []
+
+
+def test_inbox_is_oldest_first(store):
+    a = save(store, to_device="pc")
+    b = save(store, to_device="pc")
+    assert [i.id for i in store.inbox("pc")] == [a.id, b.id]
+
+
+def test_ack_by_another_device_is_not_found(store):
+    a = save(store, to_device="pc")
+    with pytest.raises(SpiderError) as exc:
+        store.ack(a.id, "mac")
+    assert exc.value.code is ErrorCode.not_found
+
+
+def test_ack_of_a_missing_item_is_not_found(store):
+    with pytest.raises(SpiderError) as exc:
+        store.ack("01ARZ3NDEKTSV4RRFFQ69G5FAV", "pc")
+    assert exc.value.code is ErrorCode.not_found
+
+
+def test_history_lists_downloads_oldest_first(store):
+    item = save(store)
+    t0 = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+    store.record_download(item.id, "b", ClientKind.gui, "/b", now=t0 + timedelta(seconds=1))
+    store.record_download(item.id, "a", ClientKind.cli, "/a", now=t0)
+    history = store.history(item.id)
+    assert history.item.id == item.id
+    assert [d.device for d in history.downloads] == ["a", "b"]
+
+
+def test_deleting_an_item_deletes_its_history(store):
+    item = save(store)
+    store.record_download(item.id, "pc", ClientKind.gui, "/x")
+    store.delete(item.id)
+    assert count_rows(store, "downloads") == 0
