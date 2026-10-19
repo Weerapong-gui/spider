@@ -131,6 +131,8 @@ def test_list_and_delete(api):
         ("noext", "audio/mpeg", ItemKind.file, "audio"),
         ("notes", "text/plain; charset=utf-8", ItemKind.text, "text"),
         ("x.weird", "application/octet-stream", ItemKind.file, "file"),
+        ("see main.py", "text/plain; charset=utf-8", ItemKind.text, "text"),
+        ("x.weird", "image/x-foo", ItemKind.file, "image"),
     ],
 )
 def test_icon_name(name, ctype, kind, expected):

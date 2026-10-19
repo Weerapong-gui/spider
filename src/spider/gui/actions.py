@@ -123,11 +123,17 @@ def delete_item(client: SpiderClient, item_id: str) -> None:
 
 
 def icon_name(name: str, content_type: str, kind: ItemKind) -> str:
-    """Pick the icon stem for a list row: extension, then content-type family."""
+    """Pick the icon stem for a list row: text items, extension, then content-type family.
+
+    Text items are named after their first line, so a snippet called "see main.py"
+    must not look like a Python file.
+    """
+    if kind is ItemKind.text:
+        return "text"
     extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if extension in ICON_BY_EXTENSION:
         return ICON_BY_EXTENSION[extension]
     family = content_type.split("/", 1)[0].strip().lower()
     if family in ICON_BY_FAMILY:
         return ICON_BY_FAMILY[family]
-    return "text" if kind is ItemKind.text else "file"
+    return "file"
