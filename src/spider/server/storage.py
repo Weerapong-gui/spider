@@ -29,6 +29,7 @@ from spider.core.models import (
     ItemPage,
     new_ulid,
 )
+from spider.server import thumbnails
 
 PREVIEW_CHARS = 200
 _PREVIEW_BYTES = PREVIEW_CHARS * 4  # worst case for UTF-8
@@ -90,6 +91,7 @@ class Storage:
         self.data_dir = Path(data_dir)
         self.blobs_dir = self.data_dir / "blobs"
         self.tmp_dir = self.blobs_dir / "tmp"
+        self.thumbs_dir = self.data_dir / "thumbs"
         self.db_path = self.data_dir / "db.sqlite"
         self.min_free_bytes = int(min_free_gb * 1024**3)
         self.chunk_size = chunk_size
@@ -125,6 +127,9 @@ class Storage:
 
     def blob_path(self, item_id: str) -> Path:
         return self.blobs_dir / item_id[0:2] / item_id[2:4] / item_id
+
+    def thumb_path(self, item_id: str) -> Path:
+        return self.thumbs_dir / item_id[0:2] / item_id[2:4] / f"{item_id}.png"
 
     def tmp_path(self, item_id: str) -> Path:
         return self.tmp_dir / f"{item_id}.part"
@@ -351,6 +356,30 @@ class Storage:
             )
         return path.open("rb")
 
+    def thumbnail(self, item_id: str) -> Path | None:
+        """Return the cached thumbnail, rendering it on first use.
+
+        A failed render leaves a zero-byte marker so a broken file is tried once,
+        not on every request. Thumbnails live beside the blobs, never in them.
+        """
+        item = self.get(item_id)
+        base_type = item.content_type.split(";")[0].strip().lower()
+        if base_type not in thumbnails.SUPPORTED_TYPES:
+            return None
+        if item.size > thumbnails.MAX_SOURCE_BYTES:
+            return None
+        target = self.thumb_path(item.id)
+        if target.is_file():
+            return target if target.stat().st_size > 0 else None
+        source = self.blob_path(item.id)
+        if not source.is_file():
+            return None
+        if thumbnails.render(source, target):
+            return target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+        return None
+
     def delete(self, item_id: str) -> None:
         """Drop the row first, then the blob.
 
@@ -365,6 +394,7 @@ class Storage:
         finally:
             connection.close()
         self.blob_path(item.id).unlink(missing_ok=True)
+        self.thumb_path(item.id).unlink(missing_ok=True)
 
     def touch_device(self, name: str, client: ClientKind, *, now: datetime | None = None) -> None:
         """Record that `name` was just seen, without touching its heartbeat."""
@@ -511,6 +541,11 @@ class Storage:
                 continue
             if blob.stat().st_mtime < cutoff:
                 blob.unlink(missing_ok=True)
+                removed += 1
+
+        for thumb in self.thumbs_dir.rglob("*.png"):
+            if thumb.stem not in known and thumb.stat().st_mtime < cutoff:
+                thumb.unlink(missing_ok=True)
                 removed += 1
 
         return removed
