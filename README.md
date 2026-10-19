@@ -87,6 +87,9 @@ spider rm REF                delete
 spider verify                check every item still has its file
 ```
 
+Update the server before the clients: a server older than `--to` silently
+ignores it and the item reaches nobody's inbox.
+
 `ref` is an item id, any unambiguous prefix of one, or `latest`.
 
 Exit codes: 3 unauthorized, 4 not found, 5 ambiguous id, 6 checksum
