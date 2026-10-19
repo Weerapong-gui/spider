@@ -63,6 +63,55 @@ def test_push_bytes_returns_an_item(api):
     assert item.source_device == "test-device"
 
 
+def test_client_sends_identity_headers(api, store):
+    api.list_items()
+    assert [d.name for d in store.list_devices()] == ["test-device"]
+
+
+def test_push_to_device_lands_in_its_inbox(api, config):
+    other = SpiderClient(
+        ClientConfig(server=config.server, token=TOKEN, device="ไลน์"),
+        transport=api._http._transport,
+    )
+    other.heartbeat()
+    item = api.push_bytes(b"hi", kind=ItemKind.text, name="n", to_device="ไลน์")
+    assert item.to_device == "ไลน์"
+    assert [i.id for i in other.inbox()] == [item.id]
+    other.ack(item.id)
+    assert other.inbox() == []
+    assert {d.name for d in api.devices()} == {"test-device", "ไลน์"}
+    api.remove_device("ไลน์")
+    assert {d.name for d in api.devices()} == {"test-device"}
+    other.close()
+
+
+def test_thumbnail_of_a_text_item_is_none(api):
+    item = api.push_bytes(b"hi", kind=ItemKind.text, name="n")
+    assert api.thumbnail(item.id) is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Not Found", '{"detail": "Not Found"}', '{"error": {"code": "not_found", "message": "x"}}'],
+)
+def test_supports_devices_is_false_against_an_old_server(config, body):
+    transport = httpx.MockTransport(lambda request: httpx.Response(404, text=body))
+    with SpiderClient(config, transport=transport) as client:
+        assert client.supports_devices() is False
+        assert client.thumbnail("x") is None
+
+
+def test_supports_devices_is_true_against_this_server(api):
+    assert api.supports_devices() is True
+
+
+def test_report_download_appears_in_history(api):
+    item = api.push_bytes(b"hi", kind=ItemKind.text, name="n")
+    api.report_download(item.id, "dl/x")
+    history = api.history(item.id)
+    assert [(d.device, d.destination) for d in history.downloads] == [("test-device", "dl/x")]
+
+
 def test_push_file_reads_from_disk(api, tmp_path):
     path = tmp_path / "report.pdf"
     path.write_bytes(b"%PDF-1.7 body")

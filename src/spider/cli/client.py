@@ -16,7 +16,17 @@ import httpx
 
 from spider.core.config import ClientConfig
 from spider.core.errors import ErrorCode, SpiderError
-from spider.core.models import Item, ItemKind, ItemPage
+from spider.core.models import (
+    CLIENT_HEADER,
+    DEVICE_HEADER,
+    ClientKind,
+    Device,
+    Item,
+    ItemHistory,
+    ItemKind,
+    ItemPage,
+    encode_device,
+)
 
 _DOWNLOAD_CHUNK = 1024 * 1024
 _HASH_CHUNK = 1024 * 1024
@@ -36,11 +46,16 @@ class SpiderClient:
         config: ClientConfig,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
+        client_kind: ClientKind = ClientKind.cli,
     ) -> None:
         self.config = config
         self._http = httpx.Client(
             base_url=config.server,
-            headers={"Authorization": f"Bearer {config.token}"},
+            headers={
+                "Authorization": f"Bearer {config.token}",
+                DEVICE_HEADER: encode_device(config.device),
+                CLIENT_HEADER: client_kind.value,
+            },
             timeout=httpx.Timeout(timeout, read=None, write=None),
             transport=transport,
             follow_redirects=False,
@@ -67,7 +82,15 @@ class SpiderClient:
             message = f"Server returned HTTP {response.status_code}."
         raise SpiderError(code, message)
 
-    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+    def _request(
+        self, method: str, url: str, *, allow_404: bool = False, **kwargs
+    ) -> httpx.Response:
+        """`allow_404` hands a 404 back untouched.
+
+        An old server answers unknown routes from its static-file mount with a
+        plain-text 404, not the shared error shape, so callers probing for newer
+        endpoints must look at the status rather than the error code.
+        """
         try:
             response = self._http.request(method, url, **kwargs)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -78,7 +101,8 @@ class SpiderClient:
             ) from exc
         except httpx.HTTPError as exc:
             raise SpiderError(ErrorCode.unreachable, f"Network error: {exc}") from exc
-        self._raise_for_error(response)
+        if not (allow_404 and response.status_code == 404):
+            self._raise_for_error(response)
         return response
 
     def push_bytes(
@@ -88,6 +112,7 @@ class SpiderClient:
         kind: ItemKind,
         name: str,
         content_type: str | None = None,
+        to_device: str | None = None,
     ) -> Item:
         guessed = content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
         response = self._request(
@@ -99,11 +124,14 @@ class SpiderClient:
                 "name": name,
                 "device": self.config.device,
                 "sha256": hashlib.sha256(payload).hexdigest(),
+                **({"to_device": to_device} if to_device else {}),
             },
         )
         return Item.model_validate(response.json())
 
-    def push_file(self, path: Path, *, name: str | None = None) -> Item:
+    def push_file(
+        self, path: Path, *, name: str | None = None, to_device: str | None = None
+    ) -> Item:
         """Hash the file, then stream it.
 
         Reading twice costs a second pass over the disk, and buys an end-to-end
@@ -122,6 +150,7 @@ class SpiderClient:
                     "name": display_name,
                     "device": self.config.device,
                     "sha256": checksum,
+                    **({"to_device": to_device} if to_device else {}),
                 },
             )
         return Item.model_validate(response.json())
@@ -174,3 +203,35 @@ class SpiderClient:
     def verify(self) -> list[Item]:
         payload = self._request("GET", "/api/verify").json()
         return [Item.model_validate(entry) for entry in payload["missing"]]
+
+    def devices(self) -> list[Device]:
+        return [Device.model_validate(d) for d in self._request("GET", "/api/devices").json()]
+
+    def supports_devices(self) -> bool:
+        """False against a server that predates the device endpoints."""
+        return self._request("GET", "/api/devices", allow_404=True).status_code != 404
+
+    def heartbeat(self) -> None:
+        self._request("POST", "/api/devices/heartbeat")
+
+    def stop_heartbeat(self) -> None:
+        self._request("DELETE", "/api/devices/heartbeat")
+
+    def remove_device(self, name: str) -> None:
+        self._request("DELETE", f"/api/devices/{encode_device(name)}")
+
+    def inbox(self) -> list[Item]:
+        return [Item.model_validate(i) for i in self._request("GET", "/api/inbox").json()]
+
+    def ack(self, item_id: str) -> None:
+        self._request("POST", f"/api/inbox/{item_id}/ack")
+
+    def report_download(self, item_id: str, destination: str) -> None:
+        self._request("POST", f"/api/items/{item_id}/downloads", json={"destination": destination})
+
+    def history(self, ref: str) -> ItemHistory:
+        return ItemHistory.model_validate(self._request("GET", f"/api/items/{ref}/history").json())
+
+    def thumbnail(self, item_id: str) -> bytes | None:
+        response = self._request("GET", f"/api/items/{item_id}/thumbnail", allow_404=True)
+        return None if response.status_code == 404 else response.content
