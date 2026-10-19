@@ -109,6 +109,21 @@ The first launch asks for the server address and token (the same values as
 - Double-click a text item to put it on the clipboard, a file to save it
   (checksum verified, written to a `.part` file first)
 - Right-click for Copy, Save as…, Delete
+- The sidebar lists the server (green when reachable) and every device that
+  has talked to it: **Running** for desktop apps seen in the last 30 seconds,
+  **Offline** with when each was last seen. Right-click an offline device to
+  remove it from the list
+- Send to one device: drop files onto its name in the sidebar, or right-click
+  it for **Send clipboard to this device** / **Send files to this device…**.
+  The item still shows in everyone's list; only that device is notified
+- When something is sent to this machine, a notification appears even with
+  the window open, and a banner above the list offers **Save to Downloads**
+  (files; a clash becomes `name (1).ext`, nothing is overwritten) or **Copy**
+  (text), plus **Dismiss**. The tray menu also lists the newest five as
+  **Receive …**. Nothing is saved until you click. Each item notifies once
+- Select a row to see its history: where it was uploaded from and every
+  download since (device, and the path or "clipboard")
+- Images show a thumbnail in the list; other files show a file-type icon
 - Closing the window keeps spider running in the tray; Quit is in the tray
   menu and under File. Where no tray exists (some Wayland sessions), closing
   the window quits.
@@ -142,3 +157,7 @@ These are not covered by the test suite:
 - [ ] Push a file whose name is in Thai and confirm it downloads with the name intact
 - [ ] Stop the container mid-upload and confirm `spider ls` does not show a partial item
 - [ ] Delete a blob directly on the server and confirm `spider verify` reports it
+- [ ] Send from the Mac to the PC; the PC notification appears within ~10 s and clicking it saves to Downloads (record per OS whether clicking the notification itself works, or only the banner / tray menu)
+- [ ] Quit the GUI on one machine; it turns grey on the other within ~30 s
+- [ ] Drop a file onto a device name in the sidebar
+- [ ] Photos taken in portrait on a phone show upright previews

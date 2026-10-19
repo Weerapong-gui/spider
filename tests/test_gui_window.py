@@ -24,6 +24,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from spider.cli.client import SpiderClient  # noqa: E402
 from spider.core.config import MIN_TOKEN_LENGTH, ClientConfig  # noqa: E402
+from spider.core.models import ItemKind  # noqa: E402
+from spider.gui import actions  # noqa: E402
 from spider.gui.window import MainWindow, SettingsDialog  # noqa: E402
 from spider.server.app import create_app  # noqa: E402
 from spider.server.storage import Storage  # noqa: E402
@@ -364,3 +366,117 @@ def test_from_column_shows_the_target(window, other):
     assert window.statusBar().currentMessage() == (
         "park-macbook has no desktop app running; it will see this when it opens one."
     )
+
+
+def known(window):
+    """Let the server learn this device, so items can be sent to it."""
+    window.refresh()
+    settle(window, lambda: any(device.name == "gui-test" for device in window._devices))
+
+
+def banner_texts(window):
+    return [row.label.text() for row in window._notice_rows.values()]
+
+
+def banner_button(window, text):
+    [row] = window._notice_rows.values()
+    assert row.action.text() == text
+    return row.action
+
+
+def test_an_item_sent_here_shows_a_banner_once(window, other):
+    known(window)
+    other.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    assert banner_texts(window) == ["r.pdf (1 B) — click to save to Downloads"]
+    assert window._last_notice.message == banner_texts(window)[0]
+    assert "Receive r.pdf" in tray_entries(window)
+    window.refresh()
+    settle(window, lambda: True)
+    QThreadPool.globalInstance().waitForDone(5000)
+    QCoreApplication.processEvents()
+    assert len(banner_texts(window)) == 1
+
+
+def tray_entries(window):
+    if window.tray is None:
+        return [action.text() for action in window._receive_actions]
+    return [action.text() for action in window.tray.contextMenu().actions()]
+
+
+def test_banner_save_puts_the_file_in_downloads(window, other, tmp_path, monkeypatch):
+    downloads = tmp_path / "Downloads"
+    monkeypatch.setattr(actions, "downloads_dir", lambda: downloads)
+    (downloads).mkdir()
+    (downloads / "r.pdf").write_bytes(b"already here")
+    known(window)
+    other.push_bytes(b"pdf bytes", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    banner_button(window, "Save to Downloads").click()
+    settle(window, lambda: not banner_texts(window))
+    assert (downloads / "r.pdf").read_bytes() == b"already here"
+    assert (downloads / "r (1).pdf").read_bytes() == b"pdf bytes"
+    assert window.statusBar().currentMessage() == f"Saved to {downloads / 'r (1).pdf'}"
+    assert not any(text.startswith("Receive") for text in tray_entries(window))
+
+
+def test_several_files_are_received_together(window, other, tmp_path, monkeypatch):
+    downloads = tmp_path / "Downloads"
+    monkeypatch.setattr(actions, "downloads_dir", lambda: downloads)
+    known(window)
+    for name in ("a.txt", "b.txt"):
+        other.push_bytes(name.encode(), kind=ItemKind.file, name=name, to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    assert banner_texts(window) == ["2 files from park-macbook — click to receive all"]
+    window.receive_notice(window._last_notice)
+    settle(window, lambda: not banner_texts(window))
+    assert sorted(path.name for path in downloads.iterdir()) == ["a.txt", "b.txt"]
+
+
+def test_banner_copy_puts_text_on_the_clipboard(window, other):
+    QGuiApplication.clipboard().setText("before")
+    known(window)
+    other.push_bytes("สวัสดี".encode(), kind=ItemKind.text, name="greeting", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    assert banner_texts(window) == ["greeting — click to copy to the clipboard"]
+    banner_button(window, "Copy").click()
+    settle(window, lambda: QGuiApplication.clipboard().text() == "สวัสดี")
+    settle(window, lambda: not banner_texts(window))
+    assert window.statusBar().currentMessage() == "Copied “greeting” to the clipboard"
+
+
+def test_receiving_a_deleted_item_says_so(window, other, store, tmp_path, monkeypatch):
+    monkeypatch.setattr(actions, "downloads_dir", lambda: tmp_path / "Downloads")
+    known(window)
+    item = other.push_bytes(b"gone", kind=ItemKind.file, name="gone.bin", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    other.delete(item.id)
+    banner_button(window, "Save to Downloads").click()
+    settle(window, lambda: "no longer" in window.statusBar().currentMessage())
+    assert window.statusBar().currentMessage() == "“gone.bin” is no longer on the server"
+    assert not banner_texts(window)
+
+
+def test_dismiss_removes_the_banner_row(window, other):
+    known(window)
+    other.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    [row] = window._notice_rows.values()
+    row.dismiss.click()
+    assert banner_texts(window) == []
+    assert window.banner.isHidden()
+
+
+def test_quit_clears_the_heartbeat(window, store):
+    window.refresh()
+    settle(window, lambda: any(d.name == "gui-test" for d in window._devices))
+    assert [d.online for d in store.list_devices() if d.name == "gui-test"] == [True]
+    window.quit_for_real()
+    QThreadPool.globalInstance().waitForDone(5000)
+    assert [d.online for d in store.list_devices() if d.name == "gui-test"] == [False]
