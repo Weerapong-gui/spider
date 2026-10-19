@@ -41,6 +41,34 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at DESC);
 """
 
+SCHEMA_VERSION = 1
+
+# Entry n upgrades a database from user_version n to n + 1.
+_MIGRATIONS: list[str] = [
+    """
+ALTER TABLE items ADD COLUMN to_device TEXT;
+ALTER TABLE items ADD COLUMN notified_at TEXT;
+CREATE INDEX idx_items_inbox ON items(to_device) WHERE notified_at IS NULL;
+
+CREATE TABLE devices (
+  name TEXT PRIMARY KEY,
+  client TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  heartbeat_at TEXT
+);
+
+CREATE TABLE downloads (
+  id INTEGER PRIMARY KEY,
+  item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  device TEXT NOT NULL,
+  client TEXT NOT NULL,
+  destination TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX idx_downloads_item ON downloads(item_id);
+"""
+]
+
 
 class Storage:
     def __init__(
@@ -58,11 +86,24 @@ class Storage:
 
     def init(self) -> None:
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path)
+        # Autocommit mode, so the BEGIN/COMMIT below are the only transaction
+        # and the user_version bump commits atomically with the migration.
+        connection = sqlite3.connect(self.db_path, isolation_level=None)
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
-            connection.commit()
+            current = connection.execute("PRAGMA user_version").fetchone()[0]
+            for index in range(current, len(_MIGRATIONS)):
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in _MIGRATIONS[index].split(";"):
+                        if statement.strip():
+                            connection.execute(statement)
+                    connection.execute(f"PRAGMA user_version = {index + 1}")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+                connection.execute("COMMIT")
         finally:
             connection.close()
 
@@ -103,6 +144,7 @@ class Storage:
         content_type: str,
         source_device: str,
         expected_sha256: str | None = None,
+        to_device: str | None = None,
     ) -> Item:
         """Stream bytes to disk, then publish them atomically.
 
@@ -163,12 +205,14 @@ class Storage:
             created_at=datetime.now(UTC),
             source_device=source_device,
             preview=self._build_preview(kind, bytes(head)),
+            to_device=to_device,
         )
         connection = self.connect()
         try:
             connection.execute(
                 "INSERT INTO items (id, kind, name, size, sha256, content_type,"
-                " created_at, source_device, preview) VALUES (?,?,?,?,?,?,?,?,?)",
+                " created_at, source_device, preview, to_device)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     item.id,
                     item.kind.value,
@@ -179,6 +223,7 @@ class Storage:
                     item.created_at.isoformat(),
                     item.source_device,
                     item.preview,
+                    item.to_device,
                 ),
             )
             connection.commit()
@@ -198,6 +243,7 @@ class Storage:
             created_at=datetime.fromisoformat(row["created_at"]),
             source_device=row["source_device"],
             preview=row["preview"],
+            to_device=row["to_device"],
         )
 
     def get(self, item_id: str) -> Item:

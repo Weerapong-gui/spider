@@ -2,7 +2,7 @@ import json
 import re
 from datetime import UTC, datetime
 
-from spider.core.models import Item, ItemKind, ItemPage, new_ulid
+from spider.core.models import Item, ItemKind, ItemPage, decode_device, encode_device, new_ulid
 
 CROCKFORD = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 
@@ -74,3 +74,22 @@ def test_item_kind_is_a_plain_string():
 def test_item_page_defaults_to_no_cursor():
     page = ItemPage(items=[])
     assert page.next_before is None
+
+
+def test_device_header_roundtrips_thai():
+    assert decode_device(encode_device("เครื่องบ้าน")) == "เครื่องบ้าน"
+    assert encode_device("เครื่องบ้าน").isascii()
+
+
+def test_item_to_device_defaults_to_none():
+    item = Item(
+        id=new_ulid(),
+        kind=ItemKind.file,
+        name="a.txt",
+        size=1,
+        sha256="0" * 64,
+        content_type="text/plain",
+        created_at=datetime.now(UTC),
+        source_device="mac",
+    )
+    assert item.to_device is None

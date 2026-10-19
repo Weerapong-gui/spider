@@ -7,8 +7,13 @@ import threading
 import time
 from datetime import datetime
 from enum import StrEnum
+from urllib.parse import quote, unquote
 
 from pydantic import BaseModel
+
+DEVICE_HEADER = "X-Spider-Device"
+CLIENT_HEADER = "X-Spider-Client"
+BROWSER_DEVICE = "browser"
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -39,6 +44,15 @@ def new_ulid() -> str:
     return "".join(_CROCKFORD[(value >> (5 * shift)) & 0x1F] for shift in range(25, -1, -1))
 
 
+def encode_device(name: str) -> str:
+    """Percent-encode a device name so it survives latin-1 HTTP headers."""
+    return quote(name, safe="")
+
+
+def decode_device(value: str) -> str:
+    return unquote(value)
+
+
 class ItemKind(StrEnum):
     text = "text"
     file = "file"
@@ -56,6 +70,32 @@ class Item(BaseModel):
     created_at: datetime
     source_device: str
     preview: str | None = None
+    to_device: str | None = None
+
+
+class ClientKind(StrEnum):
+    gui = "gui"
+    cli = "cli"
+    browser = "browser"
+
+
+class Device(BaseModel):
+    name: str
+    client: ClientKind
+    last_seen: datetime
+    online: bool
+
+
+class Download(BaseModel):
+    device: str
+    client: ClientKind
+    destination: str
+    at: datetime
+
+
+class ItemHistory(BaseModel):
+    item: Item
+    downloads: list[Download]
 
 
 class ItemPage(BaseModel):

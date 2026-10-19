@@ -46,6 +46,8 @@ def test_schema_has_the_expected_columns(store):
         "created_at",
         "source_device",
         "preview",
+        "to_device",
+        "notified_at",
     }
 
 
@@ -444,3 +446,86 @@ def test_retention_deletes_items_past_the_cutoff(store):
     with pytest.raises(SpiderError):
         store.get(old.id)
     assert store.get(recent.id).id == recent.id
+
+
+_OLD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS items (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  source_device TEXT NOT NULL,
+  preview TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at DESC);
+"""
+
+
+def user_version(store):
+    connection = store.connect()
+    try:
+        return connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+
+
+def table_names(store):
+    connection = store.connect()
+    try:
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        return {row[0] for row in rows}
+    finally:
+        connection.close()
+
+
+def test_migration_keeps_existing_rows(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+    old_id = "01J0000000000000000000000A"
+    connection = sqlite3.connect(root / "db.sqlite")
+    connection.executescript(_OLD_SCHEMA)
+    connection.execute(
+        "INSERT INTO items VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            old_id,
+            "file",
+            "old.txt",
+            1,
+            "0" * 64,
+            "text/plain",
+            "2026-08-19T00:00:00+00:00",
+            "mac",
+            None,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    store = Storage(root, min_free_gb=0)
+    store.init()
+
+    assert store.get(old_id).name == "old.txt"
+    assert store.get(old_id).to_device is None
+    assert user_version(store) == 1
+    assert {"devices", "downloads"} <= table_names(store)
+
+
+def test_init_twice_after_migration_is_a_no_op(store):
+    store.init()
+    store.init()
+    assert user_version(store) == 1
+
+
+def test_save_stores_to_device(store):
+    item = store.save(
+        stream=[b"x"],
+        kind=ItemKind.file,
+        name="a",
+        content_type="x/y",
+        source_device="mac",
+        to_device="pc",
+    )
+    assert store.get(item.id).to_device == "pc"

@@ -131,6 +131,7 @@ def test_core_uses_no_third_party_dependency_except_pydantic():
         "stat",
         "collections",
         "threading",
+        "urllib",
         "__future__",
     }
     offenders = set()
