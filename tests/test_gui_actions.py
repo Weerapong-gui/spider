@@ -293,6 +293,29 @@ def test_poll_acks_so_the_next_poll_is_empty(api, other_api):
     assert actions.poll(api).notices == []
 
 
+def test_a_failed_ack_keeps_what_was_acked_and_leaves_the_rest(api, other_api, monkeypatch):
+    """An item acked is never offered again, so it must reach the window even when
+    a later ack fails; the unacked one simply comes back next poll."""
+    api.heartbeat()
+    for name in ("one", "two"):
+        other_api.push_bytes(name.encode(), kind=ItemKind.text, name=name, to_device="gui-test")
+    real_ack = api.ack
+    acked = []
+
+    def flaky_ack(item_id):
+        if acked:
+            raise SpiderError(ErrorCode.unreachable, "dropped")
+        real_ack(item_id)
+        acked.append(item_id)
+
+    monkeypatch.setattr(api, "ack", flaky_ack)
+    first = actions.poll(api)
+    assert [n.item_ids for n in first.notices] == [acked]
+    monkeypatch.setattr(api, "ack", real_ack)
+    second = actions.poll(api)
+    assert len(second.notices) == 1 and second.notices[0].item_ids != acked
+
+
 def test_poll_against_an_old_server_returns_no_devices():
     config = ClientConfig(server="http://spider.test", token=TOKEN, device="gui-test")
     old = httpx.MockTransport(lambda request: httpx.Response(404, text="Not Found"))

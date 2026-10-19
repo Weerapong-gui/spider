@@ -207,7 +207,10 @@ class MainWindow(QMainWindow):
         self._open_settings = open_settings
         self._pool = QThreadPool.globalInstance()
         self._refresh_serial = 0
-        self._poll_serial = 0
+        # One poll at a time: it acks what it fetches, so two at once would race for
+        # the same inbox. A refresh during a poll asks for one more poll afterwards.
+        self._polling = False
+        self._poll_again = False
         self._history_serial = 0
         self._busy = 0
         self._quitting = False
@@ -411,34 +414,49 @@ class MainWindow(QMainWindow):
             lambda items: self._show_items(serial, items),
             lambda message: self.statusBar().showMessage(f"Error: {message}", 15_000),
         )
-        self._poll_serial += 1
-        poll_serial = self._poll_serial
+        self._start_poll()
+
+    def _start_poll(self) -> None:
+        if self._polling:
+            self._poll_again = True
+            return
+        if self._quitting:
+            return  # a heartbeat now would undo the one quitting just cleared
+        self._polling = True
         # The listing already reports an unreachable server in the status bar, so
         # a failed poll only turns the server light red.
-        self._start(
-            actions.poll,
-            lambda result: self._polled(poll_serial, result),
-            lambda _message: self._poll_failed(poll_serial),
-        )
+        self._start(actions.poll, self._polled, lambda _message: self._poll_failed())
 
-    def _polled(self, serial: int, result: actions.Poll) -> None:
-        if serial != self._poll_serial:
-            return
-        self._server_ok = True
-        self.show_devices(result.devices)
-        self._on_notices(result.notices)
+    def _poll_finished(self) -> None:
+        self._polling = False
+        if self._poll_again:
+            self._poll_again = False
+            self._start_poll()
 
-    def _poll_failed(self, serial: int) -> None:
-        if serial != self._poll_serial:
-            return
+    def _polled(self, result: actions.Poll) -> None:
+        """Polls never overlap, so each result is the newest; and its notices are
+        acked on the server already, so they are shown whatever else has happened."""
+        try:
+            self._server_ok = True
+            self.show_devices(result.devices)
+            self._on_notices(result.notices)
+        finally:
+            self._poll_finished()  # a rendering error must not stop polling for good
+
+    def _poll_failed(self) -> None:
         self._server_ok = False
         self._render_devices()
+        self._poll_finished()
 
     def _on_notices(self, notices: list[actions.Notice]) -> None:
         """Items sent to this device. The poll has already acked them, so each
-        must be shown now or it is never offered again."""
+        must be shown now or it is never offered again. One already pending is not
+        shown twice."""
+        pending = {i for row in self._notice_rows.values() for i in row.notice.item_ids}
         for notice in notices:
-            self.show_notice(notice)
+            if not set(notice.item_ids) <= pending:
+                self.show_notice(notice)
+                pending.update(notice.item_ids)
 
     def _show_items(self, serial: int, items: list[Item]) -> None:
         if serial != self._refresh_serial:

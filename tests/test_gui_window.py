@@ -399,6 +399,56 @@ def test_an_item_sent_here_shows_a_banner_once(window, other):
     assert len(banner_texts(window)) == 1
 
 
+def test_overlapping_refreshes_never_lose_or_repeat_a_notice(window, other, monkeypatch):
+    """The poll acks what it fetches, so a refresh must never discard a poll's
+    notices or let a second poll race it for the same inbox."""
+    import threading
+
+    lock = threading.Lock()
+    running, most = [0], [0]
+    real_poll = actions.poll
+
+    def slow_poll(client):
+        with lock:
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+        try:
+            result = real_poll(client)
+            time.sleep(0.2)  # acked, but not yet delivered: the refreshes below overlap it
+            return result
+        finally:
+            with lock:
+                running[0] -= 1
+
+    known(window)
+    monkeypatch.setattr(actions, "poll", slow_poll)
+    other.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    window.refresh()
+    time.sleep(0.1)  # the first poll has acked the item by now
+    for _ in range(2):
+        window.refresh()
+    window.search.setText("r")
+    settle(window, lambda: bool(banner_texts(window)), timeout=3)
+    for _ in range(2):
+        window.refresh()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:  # let every queued and coalesced poll finish
+        QThreadPool.globalInstance().waitForDone(5000)
+        QCoreApplication.processEvents()
+        time.sleep(0.05)
+    assert banner_texts(window) == ["r.pdf (1 B) — click to save to Downloads"]
+    assert most[0] == 1
+
+
+def test_a_notice_already_pending_is_not_shown_again(window, other):
+    known(window)
+    other.push_bytes(b"x", kind=ItemKind.file, name="r.pdf", to_device="gui-test")
+    window.refresh()
+    settle(window, lambda: bool(banner_texts(window)))
+    window._on_notices([window._last_notice])
+    assert len(banner_texts(window)) == 1
+
+
 def tray_entries(window):
     if window.tray is None:
         return [action.text() for action in window._receive_actions]

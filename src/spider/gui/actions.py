@@ -222,10 +222,16 @@ def poll(client: SpiderClient) -> Poll:
         return Poll(None, [])
     client.heartbeat()
     devices = client.devices()
-    inbox = client.inbox()
-    for item in inbox:
-        client.ack(item.id)
-    return Poll(devices, group_notices(inbox))
+    acked: list[Item] = []
+    for item in client.inbox():
+        # Stop at the first failure but keep what was acked: those are never offered
+        # again, so they must reach the window. The rest come back next poll.
+        try:
+            client.ack(item.id)
+        except SpiderError:
+            break
+        acked.append(item)
+    return Poll(devices, group_notices(acked))
 
 
 def load_history(client: SpiderClient, ref: str) -> ItemHistory | None:
