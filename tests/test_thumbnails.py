@@ -156,3 +156,8 @@ def test_delete_and_gc_remove_thumbnails(store):
     os.utime(store.thumb_path(orphan.id), (old, old))
     store.gc(max_age_seconds=3600)
     assert not store.thumb_path(orphan.id).exists()
+
+
+def test_a_tiff_labelled_png_gets_no_thumbnail(store):
+    item = _save(store, _image_bytes("TIFF"), "image/png")
+    assert store.thumbnail(item.id) is None
